@@ -1981,7 +1981,19 @@ function beginWebSpeech(w, box) {
   let gotResult = false;
   let timer = setTimeout(() => { try { rec.stop(); } catch (e) {} }, 6000);
 
+  /* 华为浏览器假活看门狗：start() 成功但 onresult/onerror/onend 一个都不来
+   * （引擎存在却不干活）。8 秒无任何事件 → 判定假活，强制切 Vosk 离线引擎。 */
+  let anyEvent = false;
+  const watchdog = setTimeout(() => {
+    if (gotResult || anyEvent) return;
+    webSpeechDead = true; /* 本会话不再尝试 Web Speech */
+    try { rec.abort(); } catch (e) {}
+    stopSharedRecorder();
+    switchToVosk(w, box, '在线识别无响应，已切换离线引擎（首次需下载约 41MB 模型，仅一次）');
+  }, 8000);
+
   rec.onresult = e => {
+    anyEvent = true;
     gotResult = true;
     stopSharedRecorder();
     /* 取与目标词最匹配的候选 */
@@ -1994,6 +2006,7 @@ function beginWebSpeech(w, box) {
     finishFollowRead(w, best.score, best.transcript, best.confidence);
   };
   rec.onerror = ev => {
+    anyEvent = true;
     if (gotResult) return;
     stopSharedRecorder();
     let msg = '识别失败，请再试一次';
@@ -2010,6 +2023,7 @@ function beginWebSpeech(w, box) {
     box.textContent = msg;
   };
   rec.onend = () => {
+    anyEvent = true;
     clearTimeout(timer);
     stopSharedRecorder();
     if (!gotResult && fr && fr.busy && !fr.switching) {
@@ -2290,12 +2304,16 @@ function frBusy(busy) {
   if (busy === false) fr.switching = false;
 }
 
-/* 引擎入口：有 Web Speech 用 Web Speech，否则 Vosk */
+/* 引擎入口：有 Web Speech 且未被判假活用 Web Speech，否则直接 Vosk。
+ * webSpeechDead：华为浏览器等"引擎存在但不干活"（start 成功、事件永不触发），
+ * 看门狗证实一次后本会话直接走 Vosk，省去每张词卡 8 秒的无效等待。 */
+let webSpeechDead = false;
+
 function beginRecording(w, box) {
-  if (speechRecognitionSupported()) {
+  if (speechRecognitionSupported() && !webSpeechDead) {
     beginWebSpeech(w, box);
   } else {
-    switchToVosk(w, box, '正在启动离线识别…');
+    switchToVosk(w, box, webSpeechDead ? '正在启动离线识别…' : '正在启动离线识别…');
   }
 }
 
