@@ -7,7 +7,7 @@
 
 /* 应用代码版本（与 sw.js 的 CACHE 对应）。
  * 排障用：华为浏览器地址栏访问 app.js 搜此常量即可确认平板实际运行的版本。 */
-const APP_VERSION = 'v1.1.3';
+const APP_VERSION = 'v1.1.4';
 
 /* ======================================================
  * 1. 内置数据：学年、单元、单词、奖励、文章
@@ -2004,13 +2004,18 @@ function beginWebSpeech(w, box) {
   /* 华为浏览器假活看门狗（两种假活形态全覆盖）：
    * a) start() 成功但 onresult/onerror/onend 一个都不来 → 8 秒强制切 Vosk；
    * b) onend 有来但没有任何识别结果（引擎跑完了空手而归）→ 同样判定假活切 Vosk。
-   * 证实一次后 webSpeechDead 置位，本会话后续词卡直接走 Vosk。 */
+   * 证实一次后 webSpeechDead 置位，本会话后续词卡直接走 Vosk。
+   * 幂等标志：killEngine 里 rec.abort() 会异步触发 onend，其"无结果"分支会
+   * 再次进来——不加标志会启动两套 Vosk 录音（双麦克风、评分双计）。 */
   let anyEvent = false;
   let resultOrError = false;
+  let engineKilled = false;
   const killEngine = (why) => {
+    if (engineKilled) return;
+    engineKilled = true;
     webSpeechDead = true;
     try { rec.abort(); } catch (e) {}
-    stopSharedRecorder();
+    /* 不停共享录音：Vosk 接管后继续用同一份录音（回放完整） */
     switchToVosk(w, box, why);
   };
   const watchdog = setTimeout(() => {
@@ -2022,6 +2027,7 @@ function beginWebSpeech(w, box) {
     anyEvent = true;
     resultOrError = true;
     gotResult = true;
+    clearTimeout(watchdog); /* 已有结果：看门狗不再判假活 */
     stopSharedRecorder();
     /* 取与目标词最匹配的候选 */
     const alts = Array.from(e.results[0]);
@@ -2035,6 +2041,7 @@ function beginWebSpeech(w, box) {
   rec.onerror = ev => {
     anyEvent = true;
     resultOrError = true;
+    clearTimeout(watchdog); /* 已有错误（如 no-speech）：看门狗不再判假活 */
     if (gotResult) return;
     stopSharedRecorder();
     let msg = '识别失败，请再试一次';
@@ -2084,7 +2091,8 @@ function beginWebSpeech(w, box) {
 
 function switchToVosk(w, box, why) {
   if (fr) fr.switching = true;
-  stopSharedRecorder();
+  /* 不停共享录音：同词从 Web Speech 切过来时录音保持连续（回放完整）；
+   * 旧录音器由 attachSharedRecording 的同词重建分支负责收尾 */
   box.textContent = why || '正在启动离线识别…';
   beginVoskRecording(w, box).catch(err => {
     console.warn('[vosk] 离线识别不可用', err);
@@ -2143,13 +2151,20 @@ function renderModelProgress(box, info) {
 }
 
 function beginVoskRecording(w, box) {
+  const startGen = frGen; /* 下载期间的进度渲染守卫 */
   return ensureVoskModel(info => {
+    if (startGen !== frGen) return; /* 已切词：进度不再渲染 */
     renderModelProgress(box, info);
   }).then(model => {
-    if (!fr || fr.wordId !== w.id || !fr.busy) return; /* 期间已切词 */
+    if (startGen !== frGen) return; /* 期间已切词 */
+    /* 直达 Vosk 路径（webSpeechDead 后）没有 Web Speech 阶段建过 fr 会话——
+     * 此处补建。守卫用代际号判断"是否还是同一次跟读"，不再依赖 fr 非空 */
+    if (!fr || fr.wordId !== w.id || !fr.busy) attachSharedRecording(w);
+    /* attachSharedRecording 内部重建会话时 frGen 会 +1：此后的守卫必须用新代际号，
+     * 否则 getUserMedia 回调全部被误判"已切词"而静默放弃 */
+    const gen = frGen;
 
     box.textContent = '请跟读…（最长 6 秒）';
-    attachSharedRecording(w); /* 与识别并行的 MediaRecorder 录音（回放用） */
 
     return new Promise((resolve, reject) => {
       let audioCtx = null;
@@ -2165,7 +2180,7 @@ function beginVoskRecording(w, box) {
       };
 
       global.navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
-        if (!fr || fr.wordId !== w.id || !fr.busy) {
+        if (gen !== frGen || !fr || fr.wordId !== w.id || !fr.busy) {
           stream.getTracks().forEach(t => t.stop());
           resolve();
           return;
@@ -2227,13 +2242,13 @@ function beginVoskRecording(w, box) {
             }
             registerProcessor('fr-proc', FRProcessor);`;
           audioCtx.audioWorklet.addModule(URL.createObjectURL(new Blob([workletCode], { type: 'application/javascript' }))).then(() => {
-            if (!fr || fr.wordId !== w.id || !fr.busy) { cleanup(); stream.getTracks().forEach(t => t.stop()); resolve(); return; }
+            if (gen !== frGen || !fr || fr.wordId !== w.id || !fr.busy) { cleanup(); stream.getTracks().forEach(t => t.stop()); resolve(); return; }
             node = new AudioWorkletNode(audioCtx, 'fr-proc');
             node.port.onmessage = e => feed(new Float32Array(e.data));
             src.connect(node);
             node.connect(mute);
           }).catch(() => {
-            if (!fr || fr.wordId !== w.id || !fr.busy) { cleanup(); stream.getTracks().forEach(t => t.stop()); resolve(); return; }
+            if (gen !== frGen || !fr || fr.wordId !== w.id || !fr.busy) { cleanup(); stream.getTracks().forEach(t => t.stop()); resolve(); return; }
             node = audioCtx.createScriptProcessor(4096, 1, 1);
             node.onaudioprocess = e => feed(e.inputBuffer.getChannelData(0).slice(0));
             src.connect(node);
@@ -2286,6 +2301,14 @@ function mediaRecorderSupported() {
 function attachSharedRecording(w) {
   const ws = getWordState(w.id);
   if (!fr || fr.wordId !== w.id) releaseFollowRead();
+  else if (fr.recorder || fr.stream) {
+    /* 同词重建（Web Speech → Vosk 引擎切换等）：先停掉旧录音器和麦克风流，
+     * 否则引用被覆盖后永不关闭（麦克风指示灯常亮、设备占用） */
+    if (fr.recorder && fr.recorder.state !== 'inactive') { try { fr.recorder.stop(); } catch (e) {} }
+    if (fr.stream) { try { fr.stream.getTracks().forEach(t => t.stop()); } catch (e) {} }
+    fr.recorder = null;
+    fr.stream = null;
+  }
   fr = {
     wordId: w.id,
     busy: true,
@@ -4206,6 +4229,20 @@ const api = {
   clearLearningData, factoryReset, addUser, importGradeExcel, parseWordRows, applyGradeImport,
   speak, speakOnline, splitForTTS, downloadModelBlob, ensureVoskModel,
   _setTTSForTest(o) { netTTS = !!o.netTTS; },
+  /* 跟读引擎层（回归测试用：直达 Vosk 路径的会话补建） */
+  _frTest: {
+    beginRecording(w, box) { beginRecording(w, box); },
+    releaseFollowRead,
+    get fr() { return fr; },
+    get frGen() { return frGen; },
+    get webSpeechDead() { return webSpeechDead; },
+    set webSpeechDead(v) { webSpeechDead = v; },
+    get voskModel() { return voskModel; },
+    set voskModel(v) { voskModel = v; },
+    get voskBroken() { return voskBroken; },
+    set voskBroken(v) { voskBroken = v; },
+    set voskLoading(v) { voskLoading = v; },
+  },
   /* 测试注入 */
   _setState(s) { state = s; },
   _getState() { return state; },
