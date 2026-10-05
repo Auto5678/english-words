@@ -5,6 +5,10 @@
 (function (global) {
 'use strict';
 
+/* 应用代码版本（与 sw.js 的 CACHE 对应）。
+ * 排障用：华为浏览器地址栏访问 app.js 搜此常量即可确认平板实际运行的版本。 */
+const APP_VERSION = 'v1.1.2';
+
 /* ======================================================
  * 1. 内置数据：学年、单元、单词、奖励、文章
  * ====================================================== */
@@ -1981,19 +1985,26 @@ function beginWebSpeech(w, box) {
   let gotResult = false;
   let timer = setTimeout(() => { try { rec.stop(); } catch (e) {} }, 6000);
 
-  /* 华为浏览器假活看门狗：start() 成功但 onresult/onerror/onend 一个都不来
-   * （引擎存在却不干活）。8 秒无任何事件 → 判定假活，强制切 Vosk 离线引擎。 */
+  /* 华为浏览器假活看门狗（两种假活形态全覆盖）：
+   * a) start() 成功但 onresult/onerror/onend 一个都不来 → 8 秒强制切 Vosk；
+   * b) onend 有来但没有任何识别结果（引擎跑完了空手而归）→ 同样判定假活切 Vosk。
+   * 证实一次后 webSpeechDead 置位，本会话后续词卡直接走 Vosk。 */
   let anyEvent = false;
-  const watchdog = setTimeout(() => {
-    if (gotResult || anyEvent) return;
-    webSpeechDead = true; /* 本会话不再尝试 Web Speech */
+  let resultOrError = false;
+  const killEngine = (why) => {
+    webSpeechDead = true;
     try { rec.abort(); } catch (e) {}
     stopSharedRecorder();
-    switchToVosk(w, box, '在线识别无响应，已切换离线引擎（首次需下载约 41MB 模型，仅一次）');
+    switchToVosk(w, box, why);
+  };
+  const watchdog = setTimeout(() => {
+    if (gotResult || resultOrError) return;
+    killEngine('在线识别无响应，已切换离线引擎（首次需下载约 41MB 模型，仅一次）');
   }, 8000);
 
   rec.onresult = e => {
     anyEvent = true;
+    resultOrError = true;
     gotResult = true;
     stopSharedRecorder();
     /* 取与目标词最匹配的候选 */
@@ -2007,6 +2018,7 @@ function beginWebSpeech(w, box) {
   };
   rec.onerror = ev => {
     anyEvent = true;
+    resultOrError = true;
     if (gotResult) return;
     stopSharedRecorder();
     let msg = '识别失败，请再试一次';
@@ -2026,6 +2038,12 @@ function beginWebSpeech(w, box) {
     anyEvent = true;
     clearTimeout(timer);
     stopSharedRecorder();
+    /* 假活形态 b：onend 到了但既无结果也无错误（引擎空转）→ 切 Vosk */
+    if (!gotResult && !resultOrError) {
+      clearTimeout(watchdog);
+      killEngine('在线识别无结果，已切换离线引擎（首次需下载约 41MB 模型，仅一次）');
+      return;
+    }
     if (!gotResult && fr && fr.busy && !fr.switching) {
       frBusy(false);
       if (box.textContent === '请跟读…（最长 6 秒）') box.textContent = '没有识别到内容，请再试一次';
