@@ -1187,30 +1187,180 @@ function buildDailyTask(u) {
  * 7. 语音朗读与跟读（5.2 / 7.4）
  * ====================================================== */
 
+/* 朗读引擎链：系统 TTS → 在线语音（有道读音）→ 双失败则提示一次并放行回调。
+ * 背景：多数国产安卓平板没有系统 TTS 引擎，speechSynthesis.speak() 在这类
+ * 设备上静默无效——不报错、不发声、onend 也不触发，导致朗读无声、跟读
+ * 卡在"正在播放示范读音"。为此：
+ * 1) speak() 自带启动看门狗：speak() 后 2.4 秒 speaking/pending 仍为 false，
+ *    即判定系统 TTS 不可用，转在线语音并按会话缓存判定结果；
+ * 2) 在线语音用 <audio> 播放有道读音（国内直连、免密钥、播放不受 CORS
+ *    限制），需要联网；长文本自动按句分段顺序播放；
+ * 3) 无论走哪条路，onEnd 都保证恰好触发一次，跟读/听写流程不会被卡死。 */
+
 let voicesCache = null;
+let netTTS = false;         /* 系统 TTS 已判死：本会话直接走在线语音 */
+let ttsDead = false;        /* 两条路都失败 */
+let ttsDeadWarned = false;  /* 双失败提示整个会话只弹一次 */
+let netTTSAudio = null;     /* 在线语音当前 <audio>，新朗读开始时截断 */
+let netTTSToken = 0;        /* 在线语音分句链代际号：旧链不再续播 */
+let speakDeferTimer = null; /* Android cancel→speak 竞态的延迟入队定时器 */
+let speakToken = 0;         /* 朗读代际号：新朗读开始后，旧朗读的一切收尾作废 */
+
 function pickVoice() {
   if (!('speechSynthesis' in global)) return null;
-  if (!voicesCache) voicesCache = global.speechSynthesis.getVoices();
-  return voicesCache.find(v => /^en(-|_)/i.test(v.lang)) || null;
+  if (!voicesCache) {
+    const list = global.speechSynthesis.getVoices();
+    voicesCache = list && list.length ? list : null; /* 空表保持 null，下次再探 */
+  }
+  return voicesCache ? (voicesCache.find(v => /^en(-|_)/i.test(v.lang)) || null) : null;
 }
+
 if ('speechSynthesis' in global) {
   global.speechSynthesis.onvoiceschanged = () => { voicesCache = null; pickVoice(); };
 }
 
+function warnTTSDead() {
+  if (ttsDeadWarned) return;
+  ttsDeadWarned = true;
+  ttsDead = true;
+  console.warn('[tts] 系统语音引擎与在线语音均不可用');
+  alert('朗读暂时不可用：平板没有可用的语音引擎，在线语音也无法访问。\n\n' +
+    '解决办法（任选其一）：\n' +
+    '1. 在平板「设置 → 系统 → 语言和输入法 → 文字转语音输出」中安装并启用语音引擎（如讯飞语记、Google 文字转语音），然后重开应用；\n' +
+    '2. 检查网络后重试（无系统引擎时朗读走在线语音，需要联网）。');
+}
+
+/* 在线语音按句分段：接口对超长输入会截断，≤200 字符一段顺序播放 */
+function splitForTTS(text) {
+  const src = String(text);
+  if (src.length <= 200) return [src];
+  const parts = [];
+  let rest = src;
+  while (rest.length) {
+    if (rest.length <= 200) { parts.push(rest); break; }
+    let cut = -1;
+    ['. ', '? ', '! ', '; ', '.'].forEach(m => {
+      const i = rest.lastIndexOf(m, 200);
+      if (i > cut) cut = i;
+    });
+    if (cut < 20) cut = 199; /* 附近找不到断句符号就硬切 */
+    parts.push(rest.slice(0, cut + 1));
+    rest = rest.slice(cut + 1);
+  }
+  return parts;
+}
+
+function speakOnline(text, onEnd, onFail) {
+  if (netTTSAudio) { try { netTTSAudio.pause(); } catch (e) {} netTTSAudio = null; }
+  const token = ++netTTSToken;
+  const parts = splitForTTS(text);
+  let i = 0;
+  const fail = () => {
+    if (token !== netTTSToken) return;
+    netTTSToken++;
+    if (onFail) onFail();
+  };
+  const playNext = () => {
+    if (token !== netTTSToken) return;
+    if (i >= parts.length) { if (onEnd) onEnd(); return; }
+    let a;
+    try {
+      a = new Audio('https://dict.youdao.com/dictvoice?type=0&audio=' + encodeURIComponent(parts[i++]));
+    } catch (e) { fail(); return; }
+    netTTSAudio = a;
+    const guard = setTimeout(() => { try { a.pause(); } catch (e) {} fail(); }, 7000);
+    a.onended = () => { clearTimeout(guard); playNext(); };
+    a.onerror = () => { clearTimeout(guard); fail(); };
+    a.play().catch(() => { clearTimeout(guard); fail(); });
+  };
+  playNext();
+}
+
 function speak(text, onEnd) {
-  if (!('speechSynthesis' in global)) { if (onEnd) onEnd(); return; }
-  try {
-    global.speechSynthesis.cancel();
-    const u = new SpeechSynthesisUtterance(text);
-    u.lang = 'en-US';
-    const v = pickVoice();
-    if (v) u.voice = v;
-    u.rate = 0.9;
-    if (onEnd) u.onend = onEnd;
-    global.speechSynthesis.speak(u);
-  } catch (e) {
-    console.error('朗读失败', e);
-    if (onEnd) onEnd();
+  if (!text) { if (onEnd) onEnd(); return; }
+
+  const myToken = ++speakToken;
+  /* 新朗读开始：截断仍在播的在线语音（防止与本次朗读混音） */
+  if (netTTSAudio) { try { netTTSAudio.pause(); } catch (e) {} netTTSAudio = null; netTTSToken++; }
+
+  let done = false;
+  const end = () => { if (!done && myToken === speakToken) { done = true; if (onEnd) onEnd(); } };
+  const online = () => speakOnline(text, end, () => { warnTTSDead(); end(); });
+
+  if (ttsDead) { warnTTSDead(); end(); return; }
+  if (netTTS) { online(); return; }
+  if (!('speechSynthesis' in global)) { netTTS = true; online(); return; }
+
+  const synth = global.speechSynthesis;
+  let u = null;
+  let watchdog = null;
+  let deadline = null;
+  const stopGuards = () => {
+    if (watchdog) { clearInterval(watchdog); watchdog = null; }
+    if (deadline) { clearTimeout(deadline); deadline = null; }
+  };
+
+  /* 判定系统 TTS 不可用：先摘掉事件再 cancel（cancel 触发的 onend 会抢先
+   * 消耗 end，导致跟读在在线示范音还没播完时就开录），然后转在线语音 */
+  const giveUp = () => {
+    if (myToken !== speakToken) { stopGuards(); return; }
+    stopGuards();
+    netTTS = true;
+    try { if (u) { u.onend = null; u.onerror = null; } } catch (e) {}
+    try { synth.cancel(); } catch (e) {}
+    online();
+  };
+
+  const utter = () => {
+    try {
+      u = new SpeechSynthesisUtterance(text);
+      u.lang = 'en-US';
+      const v = pickVoice();
+      if (v) u.voice = v;
+      u.rate = 0.9;
+      u.onend = () => { stopGuards(); end(); };
+      /* 被 cancel/interrupt 打断不是故障：只收尾不转在线（多半是新词开读了） */
+      u.onerror = ev => {
+        if (ev && (ev.error === 'canceled' || ev.error === 'interrupted')) { stopGuards(); end(); return; }
+        giveUp();
+      };
+      synth.speak(u);
+    } catch (e) {
+      console.error('朗读失败', e);
+      stopGuards();
+      netTTS = true;
+      online();
+      return;
+    }
+
+    /* 启动看门狗：无引擎的设备上 speak() 不报错也不发声 */
+    let ticks = 0;
+    watchdog = setInterval(() => {
+      if (myToken !== speakToken || done) { stopGuards(); return; }
+      if (synth.speaking || synth.pending) { stopGuards(); return; }
+      if (++ticks >= 8) giveUp();
+    }, 300);
+
+    /* 绝对兜底（仅带回调的跟读链路需要）：最迟此时放行 onEnd，绝不卡流程 */
+    if (onEnd) {
+      deadline = setTimeout(() => {
+        if (done || myToken !== speakToken) return;
+        stopGuards();
+        if (!synth.speaking) netTTS = true;
+        try { if (u) { u.onend = null; u.onerror = null; } } catch (e) {}
+        try { synth.cancel(); } catch (e) {}
+        end();
+      }, 8000 + text.length * 60);
+    }
+  };
+
+  if (speakDeferTimer) { clearTimeout(speakDeferTimer); speakDeferTimer = null; }
+  if (synth.speaking || synth.pending) {
+    /* Android Chrome 已知竞态：cancel 后立刻 speak 会被吞掉，延迟 60ms 再入队 */
+    try { synth.cancel(); } catch (e) {}
+    speakDeferTimer = setTimeout(() => { speakDeferTimer = null; utter(); }, 60);
+  } else {
+    utter();
   }
 }
 
@@ -1609,6 +1759,8 @@ function ensureVoskModel(onProgress) {
 
 /* 释放上一词的录音资源 */
 function releaseFollowRead() {
+  /* 在线示范音随切词停止（系统 TTS 由新朗读的 cancel / onend 自行收尾） */
+  if (netTTSAudio) { try { netTTSAudio.pause(); } catch (e) {} netTTSAudio = null; netTTSToken++; }
   if (fr && Array.isArray(fr.recordings)) {
     fr.recordings.forEach(r => { try { URL.revokeObjectURL(r.url); } catch (e) {} });
   }
@@ -3711,6 +3863,7 @@ const api = {
   logEvent, alreadyRewardedToday, levelOf,
   weekStartKey, monthStartKey, prevMonthRange, computePeriodStats, pctOf, buildAdvice,
   clearLearningData, factoryReset, addUser, importGradeExcel, parseWordRows, applyGradeImport,
+  speak,
   /* 测试注入 */
   _setState(s) { state = s; },
   _getState() { return state; },
