@@ -9,7 +9,7 @@
  * 注意：本应用数据全部在 localStorage / IndexedDB，与 SW 缓存无关；
  * SW 只负责离线打开页面与模型免重复下载。 */
 
-const CACHE = 'seven-a-english-v1.1.2';
+const CACHE = 'seven-a-english-v1.1.3';
 
 const CORE_FILES = [
   './',

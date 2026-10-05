@@ -7,7 +7,7 @@
 
 /* 应用代码版本（与 sw.js 的 CACHE 对应）。
  * 排障用：华为浏览器地址栏访问 app.js 搜此常量即可确认平板实际运行的版本。 */
-const APP_VERSION = 'v1.1.2';
+const APP_VERSION = 'v1.1.3';
 
 /* ======================================================
  * 1. 内置数据：学年、单元、单词、奖励、文章
@@ -1806,13 +1806,18 @@ let voskBroken = false;     /* 加载失败标记：避免每次跟读都重试 
 /* 模型分卷下载源（jsDelivr CDN 镜像 GitHub 仓库，国内可达，免实名免注册）。
  * 分卷原因：jsDelivr 单文件 20MB 上限，41MB 模型拆 3 卷。
  * 部署到自己的仓库时把 USER/repo@main 换成实际值（split-model.js 生成 model-cdn/）。 */
-let voskModelParts = [
-  'https://cdn.jsdelivr.net/gh/Auto5678/english-words@main/model-cdn/vosk-model.part1',
-  'https://cdn.jsdelivr.net/gh/Auto5678/english-words@main/model-cdn/vosk-model.part2',
-  'https://cdn.jsdelivr.net/gh/Auto5678/english-words@main/model-cdn/vosk-model.part3',
-];
 let voskPartsTotal = 41138088; /* 三卷总字节（split-model.js 实测；仅进度显示用，以响应头为准） */
 const VOSK_CACHE_KEY = 'vosk-model-blob-v1'; /* Cache API 中的完整模型条目 */
+
+/* 模型分卷的多源列表：同一文件多个镜像，逐源故障转移。
+ * jsDelivr 国内边缘节点对新上传的大文件回源慢（区域差异：一个节点 200，
+ * 另一个 404），单源不可靠；fastly 是 jsDelivr 的备用域名，raw 是最终兜底。 */
+const VOSK_PART_SOURCES = [
+  p => 'https://cdn.jsdelivr.net/gh/Auto5678/english-words@main/model-cdn/vosk-model.part' + p,
+  p => 'https://fastly.jsdelivr.net/gh/Auto5678/english-words@main/model-cdn/vosk-model.part' + p,
+  p => 'https://raw.githubusercontent.com/Auto5678/english-words/main/model-cdn/vosk-model.part' + p,
+];
+const VOSK_PART_COUNT = 3;
 
 function speechRecognitionSupported() {
   return typeof global.SpeechRecognition !== 'undefined' ||
@@ -1843,25 +1848,36 @@ function anyRecognitionEngine() {
 
 let modelBlobUrl = null; /* 已就绪的模型 blob URL（会话级，页面关闭自动回收） */
 
-async function fetchModelPart(url, onBytes) {
-  const res = await fetch(url, { cache: 'no-store' });
-  if (!res.ok) throw new Error('HTTP ' + res.status + ' @ ' + url.split('/').pop());
-  const total = parseInt(res.headers.get('Content-Length'), 10) || 0;
-  const reader = res.body.getReader();
-  const chunks = [];
-  let got = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value);
-    got += value.length;
-    if (onBytes) onBytes(got, total);
+async function fetchModelPart(partNo, onBytes) {
+  /* 逐源故障转移：某源 404/网络失败自动换下一个（jsDelivr 区域性缓存未就绪的容错） */
+  let lastErr = null;
+  for (let s = 0; s < VOSK_PART_SOURCES.length; s++) {
+    const url = VOSK_PART_SOURCES[s](partNo);
+    try {
+      const res = await fetch(url, { cache: 'no-store' });
+      if (!res.ok) { lastErr = new Error('HTTP ' + res.status + ' @ part' + partNo + '（源' + (s + 1) + '）'); continue; }
+      const total = parseInt(res.headers.get('Content-Length'), 10) || 0;
+      const reader = res.body.getReader();
+      const chunks = [];
+      let got = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        got += value.length;
+        if (onBytes) onBytes(got, total);
+      }
+      if (got === 0) { lastErr = new Error('空响应 @ part' + partNo + '（源' + (s + 1) + '）'); continue; }
+      /* 合并分卷内部块 */
+      const out = new Uint8Array(got);
+      let off = 0;
+      chunks.forEach(c => { out.set(c, off); off += c.length; });
+      return out;
+    } catch (e) {
+      lastErr = e;
+    }
   }
-  /* 合并分卷内部块 */
-  const out = new Uint8Array(got);
-  let off = 0;
-  chunks.forEach(c => { out.set(c, off); off += c.length; });
-  return out;
+  throw (lastErr || new Error('分卷 ' + partNo + ' 全部下载源失败'));
 }
 
 /* 下载全部分卷 → Blob。优先命中 Cache API（含跨会话持久缓存）。 */
@@ -1885,15 +1901,15 @@ async function downloadModelBlob(onProgress) {
     } catch (e) { /* Cache API 不可用（旧内核/隐私模式）：直接下载 */ }
   }
 
-  /* 3) 分卷下载（jsDelivr） */
+  /* 3) 分卷下载（多源故障转移） */
   const buffers = [];
   let loaded = 0;
-  for (let i = 0; i < voskModelParts.length; i++) {
-    const buf = await fetchModelPart(voskModelParts[i], (partGot) => {
+  for (let i = 0; i < VOSK_PART_COUNT; i++) {
+    const buf = await fetchModelPart(i + 1, (partGot) => {
       if (onProgress) onProgress({
         stage: 'downloading',
         part: i + 1,
-        parts: voskModelParts.length,
+        parts: VOSK_PART_COUNT,
         loaded: loaded + partGot,
         total: voskPartsTotal,
         pct: Math.min(99, Math.round((loaded + partGot) / voskPartsTotal * 100)),
