@@ -117,6 +117,28 @@ input:focus, select:focus { border-color: var(--primary); }
 .next-row { display: flex; justify-content: flex-end; margin-top: 14px; }
 .next-row .btn { min-width: 130px; }
 
+/* 语音状态栏（朗读引擎链提示） */
+.tts-status {
+  margin-top: 10px; padding: 10px 12px; border-radius: 10px;
+  font-size: 13px; line-height: 1.6; background: #fff7e6; color: #8a5b00;
+  border: 1px solid #ffe2b0;
+}
+
+/* 语音诊断面板 */
+.diag-box { background: #f8f9fd; border-radius: 10px; padding: 12px; margin: 10px 0; }
+.diag-row { padding: 5px 0; font-size: 14px; border-bottom: 1px dashed #e3e6f0; }
+.diag-row:last-child { border-bottom: none; }
+
+/* 模型下载进度条 */
+.model-progress { height: 12px; border-radius: 6px; background: #e8ebf5; overflow: hidden; margin: 8px 0 4px; }
+.model-progress > div { height: 100%; background: var(--primary); transition: width .2s; }
+.model-progress.indeterminate > div {
+  width: 35%; animation: indet 1.2s infinite ease-in-out;
+}
+@keyframes indet {
+  0% { margin-left: -35%; } 100% { margin-left: 100%; }
+}
+
 /* 阅读页 */
 .article-title { font-size: 20px; font-weight: 700; margin-bottom: 8px; }
 .article-body { font-size: 17px; line-height: 1.9; }

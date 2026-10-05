@@ -1232,24 +1232,24 @@ function buildDailyTask(u) {
  * 7. 语音朗读与跟读（5.2 / 7.4）
  * ====================================================== */
 
-/* 朗读引擎链：系统 TTS → 在线语音（有道读音）→ 双失败则提示一次并放行回调。
- * 背景：多数国产安卓平板没有系统 TTS 引擎，speechSynthesis.speak() 在这类
- * 设备上静默无效——不报错、不发声、onend 也不触发，导致朗读无声、跟读
- * 卡在"正在播放示范读音"。为此：
- * 1) speak() 自带启动看门狗：speak() 后 2.4 秒 speaking/pending 仍为 false，
- *    即判定系统 TTS 不可用，转在线语音并按会话缓存判定结果；
- * 2) 在线语音用 <audio> 播放有道读音（国内直连、免密钥、播放不受 CORS
- *    限制），需要联网；长文本自动按句分段顺序播放；
- * 3) 无论走哪条路，onEnd 都保证恰好触发一次，跟读/听写流程不会被卡死。 */
+/* 朗读引擎链：系统 TTS → 在线语音（有道读音）→ 双失败则页面内提示并放行回调。
+ * 设计要点（针对无 GMS 的华为平板/华为浏览器）：
+ * 1) 安卓系浏览器的 speechSynthesis 大多绑定谷歌 TTS 组件，无 GMS 设备上
+ *    speak() 静默无效（不报错、不发声、onend 不触发）——用 2.4s 启动看门狗
+ *    探测，超时转在线语音；判定按会话缓存（netTTS），避免每次都等；
+ * 2) 在线语音用 <audio> 播有道读音（国内可达、免密钥、无 CORS 限制），
+ *    长文本自动按句分段顺序播；**单段失败跳过续播**，绝不整链判死——
+ *    v1.0.2 曾把一次网络失败当成永久不可用，导致阅读页"点击无声音"；
+ * 3) 失败提示是页面内常驻状态条（语音状态栏），不再弹 alert；
+ * 4) 无论哪条路，onEnd 保证恰好触发一次，跟读流程不卡死。 */
 
 let voicesCache = null;
 let netTTS = false;         /* 系统 TTS 已判死：本会话直接走在线语音 */
-let ttsDead = false;        /* 两条路都失败 */
-let ttsDeadWarned = false;  /* 双失败提示整个会话只弹一次 */
 let netTTSAudio = null;     /* 在线语音当前 <audio>，新朗读开始时截断 */
 let netTTSToken = 0;        /* 在线语音分句链代际号：旧链不再续播 */
 let speakDeferTimer = null; /* Android cancel→speak 竞态的延迟入队定时器 */
 let speakToken = 0;         /* 朗读代际号：新朗读开始后，旧朗读的一切收尾作废 */
+let ttsStatus = { mode: 'idle', lastError: null }; /* 诊断面板数据源 */
 
 function pickVoice() {
   if (!('speechSynthesis' in global)) return null;
@@ -1264,15 +1264,23 @@ if ('speechSynthesis' in global) {
   global.speechSynthesis.onvoiceschanged = () => { voicesCache = null; pickVoice(); };
 }
 
-function warnTTSDead() {
-  if (ttsDeadWarned) return;
-  ttsDeadWarned = true;
-  ttsDead = true;
-  console.warn('[tts] 系统语音引擎与在线语音均不可用');
-  alert('朗读暂时不可用：平板没有可用的语音引擎，在线语音也无法访问。\n\n' +
-    '解决办法（任选其一）：\n' +
-    '1. 在平板「设置 → 系统 → 语言和输入法 → 文字转语音输出」中安装并启用语音引擎（如讯飞语记、Google 文字转语音），然后重开应用；\n' +
-    '2. 检查网络后重试（无系统引擎时朗读走在线语音，需要联网）。');
+/* 语音状态栏：学习页/阅读页底部的常驻提示（诊断面板同源）。
+ * mode: 'idle' | 'sys' | 'online' | 'error' */
+function setTTSStatus(mode, err) {
+  ttsStatus.mode = mode;
+  ttsStatus.lastError = err || null;
+  if (typeof document === 'undefined') return; /* Node 测试环境 */
+  const bar = $('#tts-status');
+  if (!bar) return;
+  const M = {
+    idle: ['', ''],
+    sys: ['语音引擎：系统 TTS', ''],
+    online: ['语音引擎：在线发音（联网）', ''],
+    error: ['朗读暂不可用', '语音不可用：系统无 TTS 引擎，在线发音失败（检查网络）。单词学习和跟读不受影响。'],
+  }[mode] || ['', ''];
+  if (!M[0]) { bar.classList.add('hidden'); bar.textContent = ''; return; }
+  bar.classList.remove('hidden');
+  bar.textContent = M[0] + (M[1] ? ' — ' + M[1] : '');
 }
 
 /* 在线语音按句分段：接口对超长输入会截断，≤200 字符一段顺序播放 */
@@ -1295,28 +1303,30 @@ function splitForTTS(text) {
   return parts;
 }
 
-function speakOnline(text, onEnd, onFail) {
+function speakOnline(text, onEnd) {
   if (netTTSAudio) { try { netTTSAudio.pause(); } catch (e) {} netTTSAudio = null; }
   const token = ++netTTSToken;
   const parts = splitForTTS(text);
   let i = 0;
-  const fail = () => {
-    if (token !== netTTSToken) return;
-    netTTSToken++;
-    if (onFail) onFail();
-  };
+  let failures = 0;
+  setTTSStatus('online');
   const playNext = () => {
     if (token !== netTTSToken) return;
-    if (i >= parts.length) { if (onEnd) onEnd(); return; }
+    if (i >= parts.length) {
+      /* 全部播完（允许个别段失败跳过）：本次朗读成功，不清 netTTS 判定 */
+      if (failures === 0 || failures < parts.length) setTTSStatus('online');
+      if (onEnd) onEnd();
+      return;
+    }
     let a;
     try {
       a = new Audio('https://dict.youdao.com/dictvoice?type=0&audio=' + encodeURIComponent(parts[i++]));
-    } catch (e) { fail(); return; }
+    } catch (e) { failures++; playNext(); return; } /* 单段失败：跳过续播 */
     netTTSAudio = a;
-    const guard = setTimeout(() => { try { a.pause(); } catch (e) {} fail(); }, 7000);
+    const guard = setTimeout(() => { try { a.pause(); } catch (e) {} a.onerror = null; a.onended = null; failures++; playNext(); }, 7000);
     a.onended = () => { clearTimeout(guard); playNext(); };
-    a.onerror = () => { clearTimeout(guard); fail(); };
-    a.play().catch(() => { clearTimeout(guard); fail(); });
+    a.onerror = () => { clearTimeout(guard); failures++; playNext(); };
+    a.play().catch(() => { clearTimeout(guard); failures++; playNext(); });
   };
   playNext();
 }
@@ -1330,9 +1340,8 @@ function speak(text, onEnd) {
 
   let done = false;
   const end = () => { if (!done && myToken === speakToken) { done = true; if (onEnd) onEnd(); } };
-  const online = () => speakOnline(text, end, () => { warnTTSDead(); end(); });
+  const online = () => speakOnline(text, end);
 
-  if (ttsDead) { warnTTSDead(); end(); return; }
   if (netTTS) { online(); return; }
   if (!('speechSynthesis' in global)) { netTTS = true; online(); return; }
 
@@ -1363,7 +1372,7 @@ function speak(text, onEnd) {
       const v = pickVoice();
       if (v) u.voice = v;
       u.rate = 0.9;
-      u.onend = () => { stopGuards(); end(); };
+      u.onend = () => { stopGuards(); setTTSStatus('sys'); end(); };
       /* 被 cancel/interrupt 打断不是故障：只收尾不转在线（多半是新词开读了） */
       u.onerror = ev => {
         if (ev && (ev.error === 'canceled' || ev.error === 'interrupted')) { stopGuards(); end(); return; }
@@ -1382,7 +1391,7 @@ function speak(text, onEnd) {
     let ticks = 0;
     watchdog = setInterval(() => {
       if (myToken !== speakToken || done) { stopGuards(); return; }
-      if (synth.speaking || synth.pending) { stopGuards(); return; }
+      if (synth.speaking || synth.pending) { stopGuards(); setTTSStatus('sys'); return; }
       if (++ticks >= 8) giveUp();
     }, 300);
 
@@ -1549,6 +1558,7 @@ function renderSession() {
       <div class="stage-tag">${phaseName(s.phase)}（${done + 1}/${total}）</div>
       ${body}
     </div>
+    <div id="tts-status" class="tts-status hidden"></div>
     <div class="progress" style="margin-top:8px"><div style="width:${pct}%"></div></div>
   `);
 
@@ -1789,7 +1799,16 @@ let frGen = 0; /* 跟读代际号：切词/重开后旧流程回调作废 */
 let voskModel = null;       /* 已就绪的 Vosk Model 实例 */
 let voskLoading = null;     /* 进行中的加载 Promise（防重复加载） */
 let voskBroken = false;     /* 加载失败标记：避免每次跟读都重试 */
-let voskModelUrl = 'model/vosk-model-small-en-us-0.15.tar.gz'; /* 相对页面解析，部署时与页面同源 */
+/* 模型分卷下载源（jsDelivr CDN 镜像 GitHub 仓库，国内可达，免实名免注册）。
+ * 分卷原因：jsDelivr 单文件 20MB 上限，41MB 模型拆 3 卷。
+ * 部署到自己的仓库时把 USER/repo@main 换成实际值（split-model.js 生成 model-cdn/）。 */
+let voskModelParts = [
+  'https://cdn.jsdelivr.net/gh/Auto5678/english-words@main/model-cdn/vosk-model.part1',
+  'https://cdn.jsdelivr.net/gh/Auto5678/english-words@main/model-cdn/vosk-model.part2',
+  'https://cdn.jsdelivr.net/gh/Auto5678/english-words@main/model-cdn/vosk-model.part3',
+];
+let voskPartsTotal = 41138088; /* 三卷总字节（split-model.js 实测；仅进度显示用，以响应头为准） */
+const VOSK_CACHE_KEY = 'vosk-model-blob-v1'; /* Cache API 中的完整模型条目 */
 
 function speechRecognitionSupported() {
   return typeof global.SpeechRecognition !== 'undefined' ||
@@ -1806,9 +1825,99 @@ function anyRecognitionEngine() {
   return speechRecognitionSupported() || voskAvailable();
 }
 
+/* ============ 模型下载管理器（主线程接管，worker 只认 blob） ============
+ *
+ * 背景：vendor-vosk 的 worker 内部 fetch 模型 URL——无进度、失败即卡死，
+ * 且 GitHub Pages 直连在国内大概率拉不动 41MB。此层接管下载：
+ * 1) 分卷从 jsDelivr 拉（单卷 ≤14MB，CDN 国内可达）；
+ * 2) 逐块读流统计字节 → 真实进度百分比；
+ * 3) 拼接成单个 Blob 后：a) 存 Cache API（下次秒加载）b) 生成 blob URL 喂
+ *    worker——vendor 代码显式支持 blob: 前缀（new URL(modelUrl, location.href
+ *    .replace(/^blob:/,""))），worker 内部下载逻辑对 blob 会直接命中
+ *    extracted.ok 缓存或从 blob 读全量；IDBFS 持久化不受影响；
+ * 4) 失败可重试（voskBroken 不再永久判死，每次跟读可重新点）。 */
+
+let modelBlobUrl = null; /* 已就绪的模型 blob URL（会话级，页面关闭自动回收） */
+
+async function fetchModelPart(url, onBytes) {
+  const res = await fetch(url, { cache: 'no-store' });
+  if (!res.ok) throw new Error('HTTP ' + res.status + ' @ ' + url.split('/').pop());
+  const total = parseInt(res.headers.get('Content-Length'), 10) || 0;
+  const reader = res.body.getReader();
+  const chunks = [];
+  let got = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    got += value.length;
+    if (onBytes) onBytes(got, total);
+  }
+  /* 合并分卷内部块 */
+  const out = new Uint8Array(got);
+  let off = 0;
+  chunks.forEach(c => { out.set(c, off); off += c.length; });
+  return out;
+}
+
+/* 下载全部分卷 → Blob。优先命中 Cache API（含跨会话持久缓存）。 */
+async function downloadModelBlob(onProgress) {
+  /* 1) 已有会话级 blob */
+  if (modelBlobUrl) return modelBlobUrl;
+
+  /* 2) Cache API 命中 */
+  if (typeof caches !== 'undefined') {
+    try {
+      const cache = await caches.open('vosk-model');
+      const hit = await cache.match(VOSK_CACHE_KEY);
+      if (hit) {
+        const blob = await hit.blob();
+        if (blob.size > 1024 * 1024) { /* 合理性检查 >1MB */
+          modelBlobUrl = URL.createObjectURL(blob);
+          if (onProgress) onProgress({ stage: 'cached', pct: 100, loaded: blob.size, total: blob.size });
+          return modelBlobUrl;
+        }
+      }
+    } catch (e) { /* Cache API 不可用（旧内核/隐私模式）：直接下载 */ }
+  }
+
+  /* 3) 分卷下载（jsDelivr） */
+  const buffers = [];
+  let loaded = 0;
+  for (let i = 0; i < voskModelParts.length; i++) {
+    const buf = await fetchModelPart(voskModelParts[i], (partGot) => {
+      if (onProgress) onProgress({
+        stage: 'downloading',
+        part: i + 1,
+        parts: voskModelParts.length,
+        loaded: loaded + partGot,
+        total: voskPartsTotal,
+        pct: Math.min(99, Math.round((loaded + partGot) / voskPartsTotal * 100)),
+      });
+    });
+    buffers.push(buf);
+    loaded += buf.length;
+  }
+
+  const blob = new Blob(buffers, { type: 'application/gzip' });
+  if (blob.size < 1024 * 1024) throw new Error('模型下载不完整（' + blob.size + ' 字节）');
+
+  /* 4) 写入 Cache API 供下次秒加载（失败不影响本次） */
+  if (typeof caches !== 'undefined') {
+    try {
+      const cache = await caches.open('vosk-model');
+      await cache.put(VOSK_CACHE_KEY, new Response(blob));
+    } catch (e) {}
+  }
+
+  modelBlobUrl = URL.createObjectURL(blob);
+  if (onProgress) onProgress({ stage: 'downloaded', pct: 100, loaded: blob.size, total: blob.size });
+  return modelBlobUrl;
+}
+
 /* 加载 Vosk 模型（幂等，防并发）。
- * onProgress(stage) 用于界面提示（'loading' = 正在下载/解压，模型在 worker 的
- * IDBFS 内部下载，精确字节进度无法从主线程观测，故只分阶段提示）。 */
+ * onProgress(info)：{stage:'downloading', part, parts, loaded, total, pct}
+ *                  | {stage:'extracting'} | {stage:'cached'} | {stage:'ready'} */
 function ensureVoskModel(onProgress) {
   if (voskModel) return Promise.resolve(voskModel);
   if (voskBroken) return Promise.reject(new Error('vosk-unavailable'));
@@ -1820,18 +1929,21 @@ function ensureVoskModel(onProgress) {
     return Promise.reject(new Error('vosk-script-missing'));
   }
 
-  voskLoading = global.Vosk.createModel(voskModelUrl, 0).then(model => {
+  const progress = typeof onProgress === 'function' ? onProgress : null;
+  voskLoading = downloadModelBlob(progress).then(blobUrl => {
+    if (progress) progress({ stage: 'extracting' });
+    return global.Vosk.createModel(blobUrl, 0);
+  }).then(model => {
     voskModel = model;
     voskLoading = null;
+    if (progress) progress({ stage: 'ready' });
     return model;
   }, err => {
-    voskBroken = true;
+    voskBroken = true; /* 本次失败；下一次点跟读重新尝试（不清 voskLoading 复用变量语义） */
     voskLoading = null;
     console.warn('[vosk] 模型加载失败', err);
     throw (err instanceof Error ? err : new Error('vosk-load-failed'));
   });
-
-  if (typeof onProgress === 'function') onProgress('loading');
   return voskLoading;
 }
 
@@ -1929,14 +2041,62 @@ function switchToVosk(w, box, why) {
   beginVoskRecording(w, box).catch(err => {
     console.warn('[vosk] 离线识别不可用', err);
     frBusy(false);
-    box.textContent = '离线识别不可用（' + (err && err.message ? err.message : '未知错误') +
-      '），跟读评分暂不可用，可继续学习其他内容。';
+    /* 失败不再静默判死：给重试按钮，下次点击重新下载 */
+    renderVoskError(box, err && err.message ? err.message : '未知错误');
   });
 }
 
+/* 模型下载失败/加载失败的界面：进度条区域变为错误提示 + 重试 */
+function renderVoskError(box, msg) {
+  const result = $('#fr-result');
+  if (!box) return;
+  box.innerHTML = `离线识别模型加载失败：${esc(msg)}`;
+  if (result) {
+    result.innerHTML = `
+    <p class="muted" style="margin-top:6px">可能原因：网络不稳（模型从 CDN 下载，约 41MB）或存储空间不足。</p>
+    <button class="btn small" id="btn-vosk-retry">↻ 重试下载</button>`;
+    const btn = $('#btn-vosk-retry');
+    if (btn) btn.onclick = () => {
+      voskBroken = false; /* 解除判死，允许重新加载 */
+      voskLoading = null;
+      result.innerHTML = '';
+      switchToVosk(currentSessionWord(), box, '正在重新下载模型…');
+    };
+  }
+}
+
+/* 当前学习卡对应的词（重试时用） */
+function currentSessionWord() {
+  if (!session) return null;
+  const w = wordMap()[session.taskIds[session.idx]];
+  return w;
+}
+
+/* 模型下载进度条渲染：
+ * info: {stage:'downloading', part, parts, loaded, total, pct}
+ *      | {stage:'extracting'} | {stage:'cached'} | {stage:'downloaded'} | {stage:'ready'} */
+function renderModelProgress(box, info) {
+  if (!box) return;
+  const mb = n => (n / 1048576).toFixed(1) + ' MB';
+  if (info.stage === 'downloading') {
+    box.innerHTML = `
+      正在下载离线识别模型（第 ${info.part}/${info.parts} 卷，仅首次）
+      <div class="model-progress"><div style="width:${info.pct}%"></div></div>
+      <span class="muted">${info.pct}% · ${mb(info.loaded)} / ${mb(info.total)}</span>`;
+  } else if (info.stage === 'extracting' || info.stage === 'downloaded') {
+    box.innerHTML = `
+      下载完成，正在解压模型（约 20-40 秒，此后永久离线可用）…
+      <div class="model-progress indeterminate"><div></div></div>`;
+  } else if (info.stage === 'cached') {
+    box.textContent = '模型已缓存，正在启动识别…';
+  } else if (info.stage === 'ready') {
+    box.textContent = '请跟读…';
+  }
+}
+
 function beginVoskRecording(w, box) {
-  return ensureVoskModel(stage => {
-    box.textContent = '正在准备离线识别模型' + (stage === 'loading' ? '（首次约 40MB，仅下载一次）…' : '…');
+  return ensureVoskModel(info => {
+    renderModelProgress(box, info);
   }).then(model => {
     if (!fr || fr.wordId !== w.id || !fr.busy) return; /* 期间已切词 */
 
@@ -1964,6 +2124,10 @@ function beginVoskRecording(w, box) {
         }
 
         audioCtx = new (global.AudioContext || global.webkitAudioContext)();
+        /* 华为浏览器等国产内核：AudioContext 初始为 suspended，不 resume 采不到音 */
+        if (audioCtx.state === 'suspended' && typeof audioCtx.resume === 'function') {
+          audioCtx.resume().catch(() => {});
+        }
         const src = audioCtx.createMediaStreamSource(stream);
 
         recognizer = new model.KaldiRecognizer(audioCtx.sampleRate, JSON.stringify(['[unk]', w.text.toLowerCase()]));
@@ -2315,6 +2479,7 @@ function renderReading() {
       </div>
     </div>
     ${weeklyHtml}
+    <div id="tts-status" class="tts-status hidden"></div>
   `);
 
   $('#btn-read-daily').onclick = () => speak(daily.text);
@@ -3212,6 +3377,7 @@ function renderParentArea() {
   const tabs = [
     ['redeem', '待确认兑换'], ['students', '学生设置'], ['scope', '背诵范围'],
     ['rewards', '奖励商品'], ['words', '词库管理'], ['backup', '数据备份'],
+    ['voice', '语音诊断'],
   ];
   let body = '';
 
@@ -3336,6 +3502,8 @@ function renderParentArea() {
       <div class="modal-actions"><button class="btn danger" id="bk-clear-learning">清除勾选学生的学习数据</button></div>
       <p class="muted" style="margin-top:14px">恢复出厂设置：删除全部数据（含词库修改、奖励、密码、全部学生账号），恢复为初始状态。此操作不可恢复，请先导出备份。</p>
       <div class="modal-actions"><button class="btn danger" id="bk-factory-reset">恢复出厂设置</button></div>`;
+  } else if (parentTab === 'voice') {
+    body = renderVoiceDiag();
   }
 
   openModal(`
@@ -3352,9 +3520,62 @@ function renderParentArea() {
   bindParentTab();
 }
 
+/* ============ 语音诊断面板（排障用：朗读引擎链/识别引擎/麦克风/模型） ============ */
+
+function renderVoiceDiag() {
+  const hasSynth = 'speechSynthesis' in global;
+  const voices = hasSynth ? (global.speechSynthesis.getVoices() || []) : [];
+  const enVoices = voices.filter(v => /^en(-|_)/i.test(v.lang));
+  const hasRec = speechRecognitionSupported();
+  const micOk = mediaRecorderSupported();
+  const modeText = {
+    idle: '尚未朗读（先在学习页或阅读页点一次朗读）',
+    sys: '系统 TTS（平板本地引擎，离线）',
+    online: '在线发音（有道，需联网）',
+    error: '失败',
+  }[ttsStatus.mode] || ttsStatus.mode;
+
+  return `
+    <h4>语音诊断</h4>
+    <p class="muted">以下信息用于排查朗读/跟读问题。截图发维护者即可定位。</p>
+    <div class="diag-box">
+      <div class="diag-row"><b>当前朗读通道：</b>${esc(modeText)}${ttsStatus.lastError ? '（' + esc(ttsStatus.lastError) + '）' : ''}</div>
+      <div class="diag-row"><b>speechSynthesis API：</b>${hasSynth ? '存在' : '不存在'}</div>
+      <div class="diag-row"><b>系统音色总数：</b>${voices.length}${enVoices.length ? '（英文 ' + enVoices.length + ' 个，首选 ' + esc(String((pickVoice() || {}).name || '无')) + '）' : '（无英文音色 → 系统 TTS 通道不可用，将走在线发音）'}</div>
+      <div class="diag-row"><b>本会话判定：</b>${netTTS ? '系统 TTS 不可用，已转在线发音' : '优先系统 TTS'}</div>
+      <div class="diag-row"><b>在线识别（Web Speech）：</b>${hasRec ? '可用' : '不可用（将走 Vosk 离线识别）'}</div>
+      <div class="diag-row"><b>Vosk 离线识别：</b>${voskBroken ? '加载失败（' + esc(voskModel ? '已就绪' : '未就绪') + '）' : (voskModel ? '已就绪（模型在本地）' : (voskLoading ? '加载中…' : '未加载（首次跟读时下载）'))}</div>
+      <div class="diag-row"><b>麦克风 API：</b>${micOk ? '可用' : '不可用（跟读评分与录音回放需要它）'}</div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn" id="diag-test-tts">🔊 试听单词朗读</button>
+      <button class="btn ghost" id="diag-test-online">🌐 强制试听在线发音</button>
+    </div>
+    <p class="muted" style="margin-top:8px">提示：安卓系浏览器的 speechSynthesis 多绑定谷歌 TTS 组件；无谷歌服务的设备上即使系统设置了讯飞/华为引擎，浏览器内也可能不出声——此时应用自动改用在线发音。</p>`;
+}
+
+function bindVoiceDiag() {
+  const b1 = $('#diag-test-tts');
+  if (b1) b1.onclick = () => {
+    setTTSStatus('idle');
+    speak('hello');
+  };
+  const b2 = $('#diag-test-online');
+  if (b2) b2.onclick = () => {
+    netTTSAudio = null;
+    speakOnline('hello', null);
+    renderParentArea();
+  };
+}
+
 /* 家长区各标签的事件绑定 */
 function bindParentTab() {
   const u = currentUser();
+
+  if (parentTab === 'voice') {
+    bindVoiceDiag();
+    return;
+  }
 
   if (parentTab === 'redeem') {
     $$('[data-confirm]').forEach(b => {
@@ -3931,7 +4152,8 @@ const api = {
   logEvent, alreadyRewardedToday, levelOf,
   weekStartKey, monthStartKey, prevMonthRange, computePeriodStats, pctOf, buildAdvice,
   clearLearningData, factoryReset, addUser, importGradeExcel, parseWordRows, applyGradeImport,
-  speak,
+  speak, speakOnline, splitForTTS, downloadModelBlob, ensureVoskModel,
+  _setTTSForTest(o) { netTTS = !!o.netTTS; },
   /* 测试注入 */
   _setState(s) { state = s; },
   _getState() { return state; },
