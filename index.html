@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<meta name="theme-color" content="#1e3ca0">
+<link rel="manifest" href="manifest.json">
+<link rel="icon" type="image/png" sizes="192x192" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<title>初中英语背单词</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+  <!-- 顶部栏：应用名称 / 当前学生 / 家长入口 -->
+  <header class="topbar">
+    <div class="topbar-title" id="topbar-title">背单词</div>
+    <button class="topbar-user" id="btn-switch-user" title="切换学生需要家长密码">👤 <span id="topbar-user-name">学生一</span></button>
+    <button class="topbar-parent" id="btn-parent">家长区</button>
+  </header>
+
+  <!-- 内容区 -->
+  <main id="content" class="content"><!-- 由 app.js 渲染 --></main>
+
+  <!-- 底部导航 -->
+  <nav class="bottom-nav" id="bottom-nav">
+    <button class="nav-btn active" data-page="today">今日</button>
+    <button class="nav-btn" data-page="reading">阅读</button>
+    <button class="nav-btn" data-page="library">词库</button>
+    <button class="nav-btn" data-page="points">积分</button>
+    <button class="nav-btn" data-page="report">报告</button>
+  </nav>
+</div>
+
+<!-- 弹窗根节点 -->
+<div id="modal-root" class="modal-root hidden"></div>
+
+<script src="vendor-xlsx.js"></script>
+<script src="vendor-vosk.js" defer></script>
+<script src="app.js" defer></script>
+</body>
+</html>
