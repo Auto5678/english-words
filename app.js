@@ -968,12 +968,15 @@ function buildBaseState() {
   };
 }
 
+/* 每日新词硬上限：产品决策为每天最多 10 个新词（5.1），家长不可调高 */
+const DAILY_NEW_MAX = 10;
+
 function makeUser(id, name) {
   return {
     id, name,
     scopeGrades: ['gPri', 'g7a'],
     scopeUnits: [],
-    dailyNew: 10,
+    dailyNew: DAILY_NEW_MAX,
     reviewLimit: 40,
     points: 0,
     wordStates: {},
@@ -1029,12 +1032,20 @@ function normalizeState(s) {
     u.scopeGrades = u.scopeGrades.filter(g => gradeIds.has(g));
     if (!u.scopeGrades.length) u.scopeGrades = ['g7a'];
     if (!Array.isArray(u.scopeUnits)) u.scopeUnits = [];
-    if (typeof u.dailyNew !== 'number' || u.dailyNew < 1) u.dailyNew = 10;
+    if (typeof u.dailyNew !== 'number' || u.dailyNew < 1) u.dailyNew = DAILY_NEW_MAX;
+    if (u.dailyNew > DAILY_NEW_MAX) u.dailyNew = DAILY_NEW_MAX; /* 每天最多 10 个新词 */
     if (typeof u.reviewLimit !== 'number' || u.reviewLimit < 0) u.reviewLimit = 40;
     if (typeof u.points !== 'number') u.points = 0;
     if (!u.wordStates || typeof u.wordStates !== 'object') u.wordStates = {};
     if (!Array.isArray(u.history)) u.history = [];
     if (!Array.isArray(u.redemptions)) u.redemptions = [];
+    /* 旧版本数据没有任务快照字段：保持缺失（首次 buildDailyTask 会生成）；
+     * 若存在但结构损坏则丢弃 */
+    if (u.dailyTaskSnapshot && (typeof u.dailyTaskSnapshot !== 'object' ||
+        typeof u.dailyTaskSnapshot.dateKey !== 'string' ||
+        !Array.isArray(u.dailyTaskSnapshot.newIds) || !Array.isArray(u.dailyTaskSnapshot.reviewIds))) {
+      delete u.dailyTaskSnapshot;
+    }
   });
   return s;
 }
@@ -1162,24 +1173,58 @@ function scopeWordIds(u) {
   return state.words.filter(w => w.enabled && unitIds.has(w.unitId)).map(w => w.id);
 }
 
+/* 每日任务生成（7.1）。
+ * 关键约束：**当天新词集一经生成即固定**——中途退出再点"开始学习"继续同一批
+ * 新词，不会重新抽（否则同一天可无限学新词）。复习队列则是动态的：
+ * 每次重算（新到期的词随时进入复习），但当天已学过的词不会混入。
+ * 实现：新词集持久化为用户级快照（dailyTaskSnapshot.newIds），当天复用；
+ * 复习队列每次实时计算。 */
 function buildDailyTask(u) {
   const tk = todayKey();
   const inScope = scopeWordIds(u);
+  const scopeSet = new Set(inScope);
 
-  /* 新词：范围内且无学习进度 */
-  const fresh = inScope.filter(id => {
-    const ws = u.wordStates[id];
-    return !ws || ws.lastReviewed == null;
+  /* 快照兜底：旧版本/快照损坏时，用"今天学过"的 learn 事件还原当天新词集 */
+  const learnedTodaySet = new Set();
+  u.history.forEach(ev => {
+    if (ev.dateKey === tk && ev.kind === 'learn' && ev.wordId && scopeSet.has(ev.wordId)) learnedTodaySet.add(ev.wordId);
   });
 
-  /* 复习词：due 不晚于今天，越早到期越优先 */
-  const due = inScope.filter(id => {
+  /* 新词集：当天快照有效则直接用；否则重新生成并写入快照 */
+  let snap = u.dailyTaskSnapshot;
+  let newIds = null;
+  if (snap && snap.dateKey === tk && Array.isArray(snap.newIds) &&
+      snap.newIds.every(id => scopeSet.has(id))) {
+    newIds = snap.newIds;
+    /* 快照没记录到的今天 learn 事件（多设备/旧版数据）并入快照 */
+    if (learnedTodaySet.size) {
+      const merged = new Set(newIds.concat(Array.from(learnedTodaySet)));
+      newIds = Array.from(merged);
+      u.dailyTaskSnapshot = { dateKey: tk, newIds };
+    }
+  } else {
+    const startedToday = inScope.filter(id => learnedTodaySet.has(id));
+    /* 新词候选：范围内、无学习进度、今天还没碰过 */
+    const fresh = inScope.filter(id => {
+      if (learnedTodaySet.has(id)) return false;
+      const ws = u.wordStates[id];
+      return !ws || ws.lastReviewed == null;
+    });
+    const remainQuota = Math.max(0, u.dailyNew - startedToday.length);
+    newIds = startedToday.concat(shuffle(fresh).slice(0, remainQuota));
+    u.dailyTaskSnapshot = { dateKey: tk, newIds };
+  }
+  saveState();
+
+  /* 复习队列：每次实时计算（due ≤ 今天且已有进度），排除当天已学的新词 */
+  const newSet = new Set(newIds);
+  const reviewIds = inScope.filter(id => {
+    if (newSet.has(id)) return false;
     const ws = u.wordStates[id];
     return ws && ws.due && keyLE(ws.due, tk) && ws.lastReviewed != null;
-  }).sort((a, b) => (u.wordStates[a].due < u.wordStates[b].due ? -1 : 1));
+  }).sort((a, b) => (u.wordStates[a].due < u.wordStates[b].due ? -1 : 1))
+    .slice(0, u.reviewLimit);
 
-  const newIds = shuffle(fresh).slice(0, u.dailyNew);
-  const reviewIds = due.slice(0, u.reviewLimit);
   return { newIds, reviewIds, dateKey: tk };
 }
 
@@ -1507,16 +1552,45 @@ function renderSession() {
     <div class="progress" style="margin-top:8px"><div style="width:${pct}%"></div></div>
   `);
 
-  /* 5.1.6：进入学习环节的词自动朗读一次；切词时释放上一词的录音 */
+  /* 5.1.6 / 5.2：进入学习卡自动执行"朗读两遍 → 自动录音评分"；
+   * 切词时释放上一词的录音与识别资源。"下一个"随时可点，不打断流程。 */
   if (s.phase === 'learn') {
     if (fr && fr.wordId !== w.id) releaseFollowRead();
-    speak(w.text);
+    autoFollowRead(w);
   }
   if (s.phase === 'listen') speak(w.text);
   bindSessionCard(w);
 }
 
-/* --- 学习卡片（含跟读） --- */
+/* 自动跟读驱动：朗读示范两遍（间隔 600ms），随后自动开录。
+ * 用代际号防重入：切词后旧流程的回调全部作废。 */
+function autoFollowRead(w) {
+  const gen = ++frGen;
+  const box = $('#fr-status');
+
+  if (!anyRecognitionEngine()) {
+    box.textContent = '当前浏览器不支持语音识别，跟读评分不可用（可继续学习其他内容）。';
+    return;
+  }
+
+  const goRecord = () => {
+    if (gen !== frGen) return; /* 已切词 */
+    beginRecording(w, box);
+  };
+  /* 第一遍 */
+  speak(w.text, () => {
+    if (gen !== frGen) return;
+    setTimeout(() => {
+      if (gen !== frGen) return;
+      /* 第二遍 */
+      speak(w.text, goRecord);
+    }, 600);
+  });
+}
+
+/* --- 学习卡片（自动跟读流程，5.2）---
+ * 进入卡片即自动：朗读示范两遍 → 自动开始录音识别 → 实时展示评分。
+ * 无跟读按钮；"下一个"按钮固定在卡片右下角，随时可切词。 */
 function renderLearnCard(w) {
   const ex = w.example
     ? `<div class="word-example">${highlightExample(w.example, w.text)}</div>`
@@ -1529,12 +1603,11 @@ function renderLearnCard(w) {
     <div class="word-meaning">${esc(w.meaning)}</div>
     ${ex}
     <div class="followread-box" id="fr-box">
-      <div id="fr-status" class="muted">点击“跟读”听示范并录音</div>
+      <div id="fr-status" class="muted">正在播放示范读音…</div>
       <div id="fr-result" style="margin-top:6px"></div>
-      <div class="row" style="margin-top:10px">
-        <button class="btn" id="btn-followread">🎤 跟读</button>
-        <button class="btn success" id="btn-next">下一个 →</button>
-      </div>
+    </div>
+    <div class="row next-row">
+      <button class="btn success" id="btn-next">下一个 →</button>
     </div>`;
 }
 
@@ -1588,11 +1661,11 @@ function bindSessionCard(w) {
   const s = session;
   if (s.phase === 'learn') {
     $('#btn-next').onclick = () => {
+      releaseFollowRead(); /* 立即停掉旧词的录音/识别/朗读链 */
       recordLearn(w);
       s.idx += 1;
       renderSession();
     };
-    $('#btn-followread').onclick = () => startFollowRead(w);
   } else if (s.phase === 'recognize') {
     $$('#quiz-options .btn').forEach(btn => {
       btn.onclick = () => {
@@ -1650,6 +1723,10 @@ function recordLearn(w) {
   const s = session;
   if (s.learnLogged[w.id]) return;
   s.learnLogged[w.id] = true;
+  /* 每天每词只记一次 learn 事件（中途退出重进不重复发 +2 分） */
+  const u = currentUser();
+  const tk = todayKey();
+  if (u.history.some(ev => ev.dateKey === tk && ev.kind === 'learn' && ev.wordId === w.id)) return;
   logEvent('learn', w.id, { points: 2 });
 }
 
@@ -1693,6 +1770,7 @@ function finishSession() {
  * }
  * 录音仅保留在内存中，不长期保存（12.1），切换单词/页面时释放。 */
 let fr = null;
+let frGen = 0; /* 跟读代际号：切词/重开后旧流程回调作废 */
 
 /* ---------- 语音识别引擎层（双引擎：Web Speech 优先，Vosk 离线降级） ----------
  *
@@ -1759,6 +1837,7 @@ function ensureVoskModel(onProgress) {
 
 /* 释放上一词的录音资源 */
 function releaseFollowRead() {
+  frGen++; /* 旧流程的一切回调（朗读续链/识别结果）立即作废 */
   /* 在线示范音随切词停止（系统 TTS 由新朗读的 cancel / onend 自行收尾） */
   if (netTTSAudio) { try { netTTSAudio.pause(); } catch (e) {} netTTSAudio = null; netTTSToken++; }
   if (fr && Array.isArray(fr.recordings)) {
@@ -1773,21 +1852,6 @@ function releaseFollowRead() {
     try { fr.stream.getTracks().forEach(t => t.stop()); } catch (e) {}
   }
   fr = null;
-}
-
-function startFollowRead(w) {
-  const box = $('#fr-status');
-  if (!anyRecognitionEngine()) {
-    box.textContent = '当前浏览器不支持语音识别，跟读评分不可用（可继续学习其他内容）。';
-    return;
-  }
-  if (fr && fr.busy) return;
-
-  $('#btn-followread').disabled = true;
-  box.textContent = '正在播放示范读音…';
-
-  /* 5.2.2 播放结束后自动开始录音 */
-  speak(w.text, () => beginRecording(w, box));
 }
 
 /* ============ Web Speech 引擎（浏览器自带，需要谷歌网络服务） ============ */
@@ -2001,6 +2065,12 @@ function beginVoskRecording(w, box) {
 /* 并行开启麦克风录音（失败不阻塞评分）。引擎层只负责识别，录音统一在这里管理，
  * 保证无论哪个引擎、无论识别成功失败，"播放录音"功能行为一致。 */
 
+function mediaRecorderSupported() {
+  return typeof global.MediaRecorder === 'function' &&
+    global.navigator && global.navigator.mediaDevices &&
+    typeof global.navigator.mediaDevices.getUserMedia === 'function';
+}
+
 function attachSharedRecording(w) {
   const ws = getWordState(w.id);
   if (!fr || fr.wordId !== w.id) releaseFollowRead();
@@ -2054,8 +2124,6 @@ function frBusy(busy) {
   if (!fr) return;
   fr.busy = busy;
   if (busy === false) fr.switching = false;
-  const btn = $('#btn-followread');
-  if (btn) btn.disabled = !!busy;
 }
 
 /* 引擎入口：有 Web Speech 用 Web Speech，否则 Vosk */
@@ -2069,7 +2137,6 @@ function beginRecording(w, box) {
 
 function finishFollowRead(w, score, transcript, confidence) {
   fr.busy = false;
-  $('#btn-followread').disabled = false;
   fr.attempts += 1;
 
   /* 5.2.8 保存最后一次评分（不发放积分） */
@@ -2335,6 +2402,7 @@ function renderToday() {
   const doneToday = u.history.some(ev => ev.dateKey === tk && ev.kind === 'dailyComplete');
   const learnedToday = u.history.filter(ev => ev.dateKey === tk && ev.kind === 'learn').length;
   const level = Math.floor(u.points / 100) + 1;
+  const inProgress = learnedToday > 0 && !doneToday;
 
   setContent(`
     <div class="card">
@@ -2349,13 +2417,14 @@ function renderToday() {
       ${doneToday ? '<p style="color:var(--success)">✓ 今日任务已完成，做得好！</p>' : ''}
       <p>新词：${task.newIds.length} 个（今日已学 ${learnedToday}）</p>
       <p>到期复习：${task.reviewIds.length} 个</p>
+      ${inProgress ? '<p class="muted">当天的任务集是固定的：再次进入会继续这一批词，不会换新词。</p>' : ''}
       ${task.newIds.length + task.reviewIds.length > 0
-        ? '<button class="btn block" id="btn-start" style="margin-top:10px">开始学习</button>'
+        ? `<button class="btn block" id="btn-start" style="margin-top:10px">${inProgress ? '继续学习' : '开始学习'}</button>`
         : '<p class="muted">今天没有新词和到期复习。可在阅读页做练习，或请家长扩大背诵范围。</p>'}
     </div>
     <div class="card">
       <h3>学习流程</h3>
-      <p class="muted">新词学习（可跟读）→ 认读测试 → 拼写测试 → 听写测试。全部完成获得 +10 积分。</p>
+      <p class="muted">新词学习（自动朗读两遍并跟读评分）→ 认读测试 → 拼写测试 → 听写测试。全部完成获得 +10 积分。</p>
     </div>
   `);
   const b = $('#btn-start');
@@ -3175,7 +3244,7 @@ function renderParentArea() {
           <div>
             <div class="form-row"><label>姓名</label><input type="text" data-uname="${i}" value="${esc(usr.name)}"></div>
             <div class="row">
-              <div class="form-row"><label>每日新词数</label><input type="number" data-unew="${i}" value="${usr.dailyNew}" min="1" max="50" style="width:100px"></div>
+              <div class="form-row"><label>每日新词数（固定 10）</label><span class="big-num">${DAILY_NEW_MAX}</span></div>
               <div class="form-row"><label>复习上限</label><input type="number" data-urev="${i}" value="${usr.reviewLimit}" min="0" max="200" style="width:100px"></div>
             </div>
           </div>
@@ -3337,9 +3406,7 @@ function bindParentTab() {
       state.users.forEach((usr, i) => {
         const name = $(`[data-uname="${i}"]`).value.trim();
         if (name) usr.name = name;
-        const nw = parseInt($(`[data-unew="${i}"]`).value, 10);
         const rv = parseInt($(`[data-urev="${i}"]`).value, 10);
-        if (nw >= 1 && nw <= 50) usr.dailyNew = nw;
         if (rv >= 0 && rv <= 200) usr.reviewLimit = rv;
       });
       saveState();
@@ -3512,6 +3579,7 @@ function clearLearningData(userIdxs) {
     u.history = [];
     u.redemptions = [];
     u.points = 0;
+    delete u.dailyTaskSnapshot; /* 清除当天任务快照，下次重新生成 */
   });
   /* 当前学生被清除时，切到第一个未清除的学生（保持数据一致性） */
   if (targets.includes(state.activeUser)) {

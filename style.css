@@ -113,6 +113,10 @@ input:focus, select:focus { border-color: var(--primary); }
 .score-mid { color: var(--warning); }
 .score-bad { color: var(--danger); }
 
+/* 学习卡"下一个"按钮：固定右下角 */
+.next-row { display: flex; justify-content: flex-end; margin-top: 14px; }
+.next-row .btn { min-width: 130px; }
+
 /* 阅读页 */
 .article-title { font-size: 20px; font-weight: 700; margin-bottom: 8px; }
 .article-body { font-size: 17px; line-height: 1.9; }

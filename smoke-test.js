@@ -104,14 +104,22 @@ t('新词均在范围内', task.newIds.every(id => {
 }));
 t('首日无复习词', task.reviewIds.length === 0);
 
-/* 复习调度：构造一个昨天到期（due=今天）的复习词 */
+/* 复习调度：当天已学且完成三题迁移的词留在当天新词集，不进当天复习队列 */
 const wid = task.newIds[0];
 app.applyDayResult(wid, false); /* 失败：明天到期 */
-/* 手动把 due 调整为今天，模拟"昨天学的失败词今天到期" */
-u2.wordStates[wid].due = app.todayKey();
+u2.wordStates[wid].due = app.todayKey(); /* 即使被人为改成今天到期 */
 const task2 = app.buildDailyTask(u2);
-t('到期词进入复习队列', task2.reviewIds.includes(wid));
-t('到期词不再算新词', !task2.newIds.includes(wid));
+t('当天已迁移词不进复习队列', !task2.reviewIds.includes(wid));
+t('当天已迁移词仍在当天新词集（快照固定）', task2.newIds.includes(wid));
+
+/* 真实到期词（昨天学、今天到期、不在当天快照）进入复习队列 */
+const wid2 = st2.words.find(x => x.id !== wid && task.newIds.includes(x.id) === false && x.unitId.startsWith('g7a')).id;
+u2.wordStates[wid2] = app.newWordState();
+u2.wordStates[wid2].lastReviewed = app.addDays(app.todayKey(), -1);
+u2.wordStates[wid2].due = app.todayKey();
+const task2b = app.buildDailyTask(u2);
+t('昨天学的到期词进入复习队列', task2b.reviewIds.includes(wid2));
+t('到期词不算新词', !task2b.newIds.includes(wid2));
 
 /* 范围限制：换 g7b 后不再出 g7a 词 */
 u2.scopeGrades = ['g7b'];
@@ -339,6 +347,37 @@ t('重复导入为替换', app._getState().units.filter(un => un.gradeId === 'g7
   app._getState().words.filter(w => w.unitId.startsWith('g7b')).length === 1);
 t('替换后总词数回落', app._getState().words.length === beforeWords + 1);
 
+/* --- 每日任务固定性：当天再进入继续同一批词，不重新抽新词 --- */
+const st5 = app.buildBaseState();
+app._setState(st5);
+const u5 = app._getCurrentUser();
+const firstTask = app.buildDailyTask(u5);
+t('每日任务：首次 10 个新词', firstTask.newIds.length === 10);
+
+/* 模拟学了其中 3 个词（生成 learn 事件） */
+firstTask.newIds.slice(0, 3).forEach((id, i) => {
+  u5.history.push({ id: 'n' + i, ts: Date.now(), dateKey: app.todayKey(), kind: 'learn', wordId: id, points: 2, correct: null, answer: null, score: null });
+});
+const secondTask = app.buildDailyTask(u5);
+t('每日任务：当天再进入仍是同一批词',
+  secondTask.newIds.length === 10 &&
+  firstTask.newIds.every(id => secondTask.newIds.includes(id)));
+t('每日任务：已学词仍在任务中（继续学）', secondTask.newIds.slice(0, 3).every(id => firstTask.newIds.includes(id)));
+
+/* 当天 10 个词全碰过后，不再出现新词 */
+firstTask.newIds.forEach((id, i) => {
+  u5.history.push({ id: 'm' + i, ts: Date.now(), dateKey: app.todayKey(), kind: 'learn', wordId: id, points: 2, correct: null, answer: null, score: null });
+});
+const thirdTask = app.buildDailyTask(u5);
+t('每日任务：10 个名额用完不再加新词', thirdTask.newIds.length === 10 &&
+  thirdTask.newIds.every(id => firstTask.newIds.includes(id)));
+
+/* normalize 把超上限的 dailyNew 压回 10 */
+const capped = app.normalizeState({ users: [{ name: 'x', dailyNew: 50 }] });
+t('dailyNew 超上限压回 10', capped.users[0].dailyNew === 10);
+const kept = app.normalizeState({ users: [{ name: 'x', dailyNew: 5 }] });
+t('dailyNew 低值保留', kept.users[0].dailyNew === 5);
+
 /* --- 语音朗读回退链（国产安卓平板无 TTS 引擎场景） ---
  * speak() 的行为不便于同步断言（内部有 2.4s 看门狗），故用注入的
  * 引擎桩异步验证后直接退出，不计入同步 t() 结果。 */
@@ -368,7 +407,7 @@ if (typeof app.speak === 'function' && global.setTimeout === setTimeout) {
     global.Audio = OrigAudio;
     console.log(`\n${passed} passed, ${failed} failed`);
     process.exit(failed ? 1 : 0);
-  }, 2800);
+  }, 4000); /* 看门狗 2.4s + 播放 40ms；余量给足，负载高时 setInterval 有漂移 */
 } else {
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);
