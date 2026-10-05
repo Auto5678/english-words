@@ -7,7 +7,7 @@
 
 /* 应用代码版本（与 sw.js 的 CACHE 对应）。
  * 排障用：华为浏览器地址栏访问 app.js 搜此常量即可确认平板实际运行的版本。 */
-const APP_VERSION = 'v1.1.4';
+const APP_VERSION = 'v1.1.5';
 
 /* ======================================================
  * 1. 内置数据：学年、单元、单词、奖励、文章
@@ -1255,6 +1255,26 @@ let speakDeferTimer = null; /* Android cancel→speak 竞态的延迟入队定�
 let speakToken = 0;         /* 朗读代际号：新朗读开始后，旧朗读的一切收尾作废 */
 let ttsStatus = { mode: 'idle', lastError: null }; /* 诊断面板数据源 */
 
+/* 语音事件日志（设备端观测）：朗读/跟读/模型链路每一步带时间戳留痕，
+ * 诊断面板展示最近 30 条，可复制发维护者。静态分析到不了的地方，
+ * 用设备上的事实说话（华为浏览器音频行为无文档，只能这么测）。 */
+const voiceLog = [];
+function vlog(msg) {
+  const ts = new Date();
+  const pad = n => String(n).padStart(2, '0');
+  voiceLog.push('[' + pad(ts.getHours()) + ':' + pad(ts.getMinutes()) + ':' + pad(ts.getSeconds()) + '] ' + msg);
+  if (voiceLog.length > 30) voiceLog.shift();
+  try { console.log('[vlog] ' + msg); } catch (e) {}
+}
+/* 拿 Audio.play() 被拒绝的原因（NotAllowedError=自动播放限制 / 网络 / 其他） */
+function describePlayError(err) {
+  if (!err) return '未知';
+  if (err.name === 'NotAllowedError') return '被浏览器拒绝（自动播放限制）';
+  if (err.name === 'NotSupportedError') return '格式不支持或网络不可达';
+  if (err.name === 'AbortError') return '被新朗读打断';
+  return (err.name || 'Error') + (err.message ? ': ' + err.message : '');
+}
+
 function pickVoice() {
   if (!('speechSynthesis' in global)) return null;
   if (!voicesCache) {
@@ -1314,23 +1334,45 @@ function speakOnline(text, onEnd) {
   let i = 0;
   let failures = 0;
   setTTSStatus('online');
+  vlog('在线发音开始（' + parts.length + ' 段，' + String(text).slice(0, 20) + '）');
   const playNext = () => {
-    if (token !== netTTSToken) return;
+    if (token !== netTTSToken) { vlog('在线发音链被截断（token 失配，多半是新朗读/切词）'); return; }
     if (i >= parts.length) {
       /* 全部播完（允许个别段失败跳过）：本次朗读成功，不清 netTTS 判定 */
-      if (failures === 0 || failures < parts.length) setTTSStatus('online');
+      if (failures > 0) {
+        vlog('在线发音结束（' + failures + '/' + parts.length + ' 段失败）');
+        setTTSStatus('error', '在线发音 ' + failures + '/' + parts.length + ' 段失败');
+      } else {
+        vlog('在线发音结束（全部段成功）');
+      }
       if (onEnd) onEnd();
       return;
     }
     let a;
+    const seg = String(parts[i]).slice(0, 15);
     try {
       a = new Audio('https://dict.youdao.com/dictvoice?type=0&audio=' + encodeURIComponent(parts[i++]));
-    } catch (e) { failures++; playNext(); return; } /* 单段失败：跳过续播 */
+    } catch (e) {
+      /* 单段失败：跳过续播。注意必须让事件循环喘口气——Audio 构造器抛错时
+       * 同步递归会无限循环卡死页面（华为浏览器音频组件异常时的真实形态） */
+      vlog('Audio 构造失败：' + (e && e.message));
+      failures++;
+      setTimeout(playNext, 0);
+      return;
+    }
     netTTSAudio = a;
-    const guard = setTimeout(() => { try { a.pause(); } catch (e) {} a.onerror = null; a.onended = null; failures++; playNext(); }, 7000);
-    a.onended = () => { clearTimeout(guard); playNext(); };
-    a.onerror = () => { clearTimeout(guard); failures++; playNext(); };
-    a.play().catch(() => { clearTimeout(guard); failures++; playNext(); });
+    const guard = setTimeout(() => {
+      try { a.pause(); } catch (e) {}
+      a.onerror = null; a.onended = null;
+      vlog('第 ' + i + ' 段超时（7s 无进展，网络不通的典型形态）: "' + seg + '"');
+      failures++; playNext();
+    }, 7000);
+    a.onended = () => { clearTimeout(guard); vlog('第 ' + i + ' 段播完: "' + seg + '"'); playNext(); };
+    a.onerror = () => { clearTimeout(guard); vlog('第 ' + i + ' 段音频错误: "' + seg + '"'); failures++; playNext(); };
+    a.play().then(
+      () => vlog('第 ' + i + ' 段 play() 成功: "' + seg + '"'),
+      err => { vlog('第 ' + i + ' 段 play() 被拒：' + describePlayError(err)); clearTimeout(guard); failures++; playNext(); }
+    );
   };
   playNext();
 }
@@ -1587,10 +1629,26 @@ function autoFollowRead(w) {
     return;
   }
 
+  /* 绝对死线：无论朗读链因何种原因卡死（网络断/音频层故障/定时器冻结），
+   * 最迟 18 秒直接进跟读环节。两遍朗读各 7s 守卫 + 600ms 间隔 ≈ 15s，
+   * 18s 覆盖全部正常路径；正常播完时先到先得，死线只是兜底。 */
+  let deadlineFired = false;
+  const deadline = setTimeout(() => {
+    if (gen !== frGen || deadlineFired) return;
+    deadlineFired = true;
+    vlog('跟读死线触发：朗读链 18s 未推进，直接进跟读（word=' + w.text + '）');
+    beginRecording(w, box);
+  }, 18000);
+
+  let recorded = false;
   const goRecord = () => {
-    if (gen !== frGen) return; /* 已切词 */
+    if (gen !== frGen || recorded) return; /* 已切词 / 已由死线触发 */
+    recorded = true;
+    clearTimeout(deadline);
+    vlog('示范朗读完成，进入跟读（word=' + w.text + '）');
     beginRecording(w, box);
   };
+  vlog('词卡开始：朗读示范 ×2（word=' + w.text + '）');
   /* 第一遍 */
   speak(w.text, () => {
     if (gen !== frGen) return;
@@ -1621,6 +1679,7 @@ function renderLearnCard(w) {
       <div id="fr-result" style="margin-top:6px"></div>
     </div>
     <div class="row next-row">
+      <button class="btn small ghost" id="btn-replay-word">🔊 重听</button>
       <button class="btn success" id="btn-next">下一个 →</button>
     </div>`;
 }
@@ -1679,6 +1738,12 @@ function bindSessionCard(w) {
       recordLearn(w);
       s.idx += 1;
       renderSession();
+    };
+    /* 重听：手指点击触发（绕开自动播放限制），且不打断进行中的流程 */
+    const replay = $('#btn-replay-word');
+    if (replay) replay.onclick = () => {
+      vlog('手动重听（word=' + w.text + '）');
+      speak(w.text);
     };
   } else if (s.phase === 'recognize') {
     $$('#quiz-options .btn').forEach(btn => {
@@ -1922,12 +1987,16 @@ async function downloadModelBlob(onProgress) {
   const blob = new Blob(buffers, { type: 'application/gzip' });
   if (blob.size < 1024 * 1024) throw new Error('模型下载不完整（' + blob.size + ' 字节）');
 
-  /* 4) 写入 Cache API 供下次秒加载（失败不影响本次） */
+  /* 4) 写入 Cache API 供下次秒加载（失败不影响本次，但记录原因——
+   *    静默失败会导致每次启动都重新下载 41MB，用户只看到"又下载了一遍"） */
   if (typeof caches !== 'undefined') {
     try {
       const cache = await caches.open('vosk-model');
       await cache.put(VOSK_CACHE_KEY, new Response(blob));
-    } catch (e) {}
+      vlog('模型缓存写入成功（' + (blob.size / 1048576).toFixed(1) + ' MB）');
+    } catch (e) {
+      vlog('模型缓存写入失败：' + (e && e.message ? e.message : e) + '（下次需重新下载）');
+    }
   }
 
   modelBlobUrl = URL.createObjectURL(blob);
@@ -1950,17 +2019,21 @@ function ensureVoskModel(onProgress) {
   }
 
   const progress = typeof onProgress === 'function' ? onProgress : null;
+  vlog('Vosk 模型加载开始');
   voskLoading = downloadModelBlob(progress).then(blobUrl => {
+    vlog('模型就绪（blob URL），开始初始化 WASM 引擎');
     if (progress) progress({ stage: 'extracting' });
     return global.Vosk.createModel(blobUrl, 0);
   }).then(model => {
     voskModel = model;
     voskLoading = null;
+    vlog('Vosk 引擎初始化成功，识别可用');
     if (progress) progress({ stage: 'ready' });
     return model;
   }, err => {
     voskBroken = true; /* 本次失败；下一次点跟读重新尝试（不清 voskLoading 复用变量语义） */
     voskLoading = null;
+    vlog('Vosk 模型加载失败：' + (err && err.message ? err.message : err));
     console.warn('[vosk] 模型加载失败', err);
     throw (err instanceof Error ? err : new Error('vosk-load-failed'));
   });
@@ -2375,6 +2448,12 @@ function beginRecording(w, box) {
 }
 
 function finishFollowRead(w, score, transcript, confidence) {
+  /* 迟到回调防御：识别结果在切词后才返回时 fr 可能已被清空/换成别的词——
+   * 直接丢弃，不打掉新会话的状态（旧版对着 null fr 写 busy 会抛错） */
+  if (!fr || fr.wordId !== w.id) {
+    vlog('丢弃迟到的识别回调（word=' + w.text + '，当前会话已切换）');
+    return;
+  }
   fr.busy = false;
   fr.attempts += 1;
 
@@ -3626,6 +3705,15 @@ function renderVoiceDiag() {
       <button class="btn" id="diag-test-tts">🔊 试听单词朗读</button>
       <button class="btn ghost" id="diag-test-online">🌐 强制试听在线发音</button>
     </div>
+    <h4 style="margin-top:16px">最近语音事件日志</h4>
+    <p class="muted">朗读/跟读/模型每一步的留痕（最近 30 条）。排查无声、卡住问题时，点"复制日志"发维护者。</p>
+    <div class="diag-box" id="diag-voice-log" style="max-height:180px;overflow-y:auto;font-size:12px;line-height:1.8">
+      ${voiceLog.length ? voiceLog.map(l => '<div class="diag-row">' + esc(l) + '</div>').join('') : '<div class="diag-row">（暂无事件：去学习页点一次朗读，或点上方试听按钮，再回来刷新）</div>'}
+    </div>
+    <div class="modal-actions">
+      <button class="btn small ghost" id="diag-copy-log">📋 复制日志</button>
+      <button class="btn small ghost" id="diag-refresh-log">↻ 刷新</button>
+    </div>
     <p class="muted" style="margin-top:8px">提示：安卓系浏览器的 speechSynthesis 多绑定谷歌 TTS 组件；无谷歌服务的设备上即使系统设置了讯飞/华为引擎，浏览器内也可能不出声——此时应用自动改用在线发音。</p>`;
 }
 
@@ -3633,14 +3721,30 @@ function bindVoiceDiag() {
   const b1 = $('#diag-test-tts');
   if (b1) b1.onclick = () => {
     setTTSStatus('idle');
+    vlog('诊断面板：手动试听单词朗读');
     speak('hello');
   };
   const b2 = $('#diag-test-online');
   if (b2) b2.onclick = () => {
     netTTSAudio = null;
+    vlog('诊断面板：手动强制试听在线发音');
     speakOnline('hello', null);
     renderParentArea();
   };
+  const bc = $('#diag-copy-log');
+  if (bc) bc.onclick = () => {
+    const text = voiceLog.join('\n') || '（空）';
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(
+        () => { bc.textContent = '✓ 已复制'; setTimeout(() => { bc.textContent = '📋 复制日志'; }, 1500); },
+        () => { alert('复制失败，请截图本页'); }
+      );
+    } else {
+      alert('此浏览器不支持一键复制，请截图本页');
+    }
+  };
+  const br = $('#diag-refresh-log');
+  if (br) br.onclick = () => renderParentArea();
 }
 
 /* 家长区各标签的事件绑定 */
@@ -4232,7 +4336,10 @@ const api = {
   /* 跟读引擎层（回归测试用：直达 Vosk 路径的会话补建） */
   _frTest: {
     beginRecording(w, box) { beginRecording(w, box); },
+    autoFollowRead,
     releaseFollowRead,
+    vlog,
+    get voiceLog() { return voiceLog; },
     get fr() { return fr; },
     get frGen() { return frGen; },
     get webSpeechDead() { return webSpeechDead; },
