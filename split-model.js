@@ -1,4 +1,4 @@
-/* 把 model/ 下的 Vosk 模型拆成 ≤20MB 分卷（jsDelivr 单文件上限 20MB）。
+/* 把 model/ 下的 Vosk 模型拆成 ≤20MB 分卷（jsDelivr 单文件上限 20MB）。。
  * 用法：node split-model.js
  * 产出 model-cdn/vosk-model.partN，全部上传到 GitHub 仓库的 model-cdn/ 目录。 */
 const fs = require('fs');
