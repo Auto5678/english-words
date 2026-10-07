@@ -7,7 +7,7 @@
 
 /* 应用代码版本（与 sw.js 的 CACHE 对应）。
  * 排障用：华为浏览器地址栏访问 app.js 搜此常量即可确认平板实际运行的版本。 */
-const APP_VERSION = 'v1.2.2';
+const APP_VERSION = 'v1.2.3';
 
 /* ======================================================
  * 1. 内置数据：学年、单元、单词、奖励、文章
@@ -3392,11 +3392,18 @@ function setTTSStatus(mode, err) {
   if (typeof document === 'undefined') return; /* Node 测试环境 */
   const bar = $('#tts-status');
   if (!bar) return;
+  const wa = typeof global.WordAudio !== 'undefined' ? global.WordAudio : null;
+  const packInfo = wa && wa.status ? wa.status : null;
   const M = {
     idle: ['', ''],
-    sys: ['语音引擎：系统 TTS', ''],
+    sys: ['语音引擎：本地音频', ''],
     online: ['语音引擎：在线发音（联网）', ''],
-    error: ['朗读暂不可用', '语音不可用：系统无 TTS 引擎，在线发音失败（检查网络）。单词学习和跟读不受影响。'],
+    /* error 文案按音频包状态分类：装了 → 纯网络问题；没装 → 引导下载 */
+    error: ['朗读暂不可用', packInfo && packInfo.count > 0
+      ? '系统无 TTS 引擎，在线发音也失败（网络不通）。已装的离线发音包只覆盖单词，句子仍需网络。'
+      : '系统无 TTS 引擎，在线发音失败（网络不通）。建议在家长区 → 离线发音 下载离线发音包（约 20MB，一次安装永久离线覆盖全部单词）。'],
+    /* 词卡场景专属：音频包未装/未命中 + 在线也不通（典型：飞行模式） */
+    offline: ['朗读暂不可用（离线）', '离线发音包尚未安装，当前又无网络。联网后在家长区 → 离线发音 下载（约 20MB，一次安装永久离线）。'],
   }[mode] || ['', ''];
   if (!M[0]) { bar.classList.add('hidden'); bar.textContent = ''; return; }
   bar.classList.remove('hidden');
@@ -3497,8 +3504,13 @@ function speak(text, onEnd) {
     wa.playWord(currentSpeakWord.id).then(how => {
       if (myToken !== speakToken) { vlog('本地音频被新朗读打断'); return; }
       if (how === 'played') { vlog('本地音频播放完成'); if (onEnd) onEnd(); return; }
-      /* miss/err → 回退原链路 */
-      vlog('本地音频未命中（' + how + '），回退原链路');
+      /* miss/err → 回退原链路。miss 时诊断关键信息：
+       * 包到底装没装（status.count > 0 = 装了但缺这个词；0 = 没装过） */
+      const installed = wa.status && wa.status.count > 0;
+      vlog('本地音频未命中（' + how + '，包' + (installed
+        ? '已装 ' + wa.status.count + ' 词但缺这个词'
+        : '未安装（0 词）——需在家长区下载') + '），回退原链路');
+      if (!installed) setTTSStatus('offline');
       speakFallback(text, onEnd);
     });
     return;
@@ -6010,6 +6022,12 @@ function bindAudioPackPanel() {
   const btnUp = $('#ap-update');
   const btnDel = $('#ap-delete');
   const box = $('#audio-pack-progress');
+
+  /* 打开面板时刷新状态再渲染（status 可能仍是初始未刷新值） */
+  const wa0 = typeof global.WordAudio !== 'undefined' ? global.WordAudio : null;
+  if (wa0 && wa0.refreshStatus) {
+    wa0.refreshStatus().then(() => renderParentArea()).catch(() => {});
+  }
 
   const run = (mode) => {
     const wa = global.WordAudio;
