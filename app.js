@@ -7,7 +7,7 @@
 
 /* 应用代码版本（与 sw.js 的 CACHE 对应）。
  * 排障用：华为浏览器地址栏访问 app.js 搜此常量即可确认平板实际运行的版本。 */
-const APP_VERSION = 'v1.2.1';
+const APP_VERSION = 'v1.2.2';
 
 /* ======================================================
  * 1. 内置数据：学年、单元、单词、奖励、文章
@@ -3482,11 +3482,14 @@ let currentSpeakWord = null;
 function speak(text, onEnd) {
   if (!text) { if (onEnd) onEnd(); return; }
 
-  /* 词卡场景 + 音频包已装：本地播放（零网络，离线可用） */
+  /* 词卡场景 + 音频包已装：本地播放（零网络，离线可用）。
+   * status.installed 为初始 false 时也尝试播放（页面刚加载、refreshStatus
+   * 还没回来；playWord 内部查 IndexedDB，miss 时返回 'miss' 走回退——
+   * 飞行模式下状态未刷新曾导致已装的音频包被绕过，误报"语音不可用"） */
   const wa = typeof global.WordAudio !== 'undefined' ? global.WordAudio : null;
   const isWordCard = currentSpeakWord && currentSpeakWord.id &&
     String(text).toLowerCase() === String(currentSpeakWord.text).toLowerCase();
-  if (wa && isWordCard && wa.status && wa.status.installed) {
+  if (wa && isWordCard && wa.playWord) {
     const myToken = ++speakToken;
     if (netTTSAudio) { try { netTTSAudio.pause(); } catch (e) {} netTTSAudio = null; netTTSToken++; }
     setTTSStatus('sys');
@@ -3495,7 +3498,7 @@ function speak(text, onEnd) {
       if (myToken !== speakToken) { vlog('本地音频被新朗读打断'); return; }
       if (how === 'played') { vlog('本地音频播放完成'); if (onEnd) onEnd(); return; }
       /* miss/err → 回退原链路 */
-      vlog('本地音频未命中（' + how + '），回退在线链路');
+      vlog('本地音频未命中（' + how + '），回退原链路');
       speakFallback(text, onEnd);
     });
     return;
@@ -6579,6 +6582,15 @@ function renderApp() {
 function init() {
   state = loadState();
   saveState(); /* 首次运行落盘 */
+
+  /* 启动时刷新离线音频包状态：wordaudio.status 初始 installed=false，
+   * 不刷新的话 speak() 会绕过已装的音频包直接走 TTS/在线链路——
+   * 离线（飞行模式）场景报"语音不可用"而音频包明明可用 */
+  if (typeof global.WordAudio !== 'undefined' && global.WordAudio.refreshStatus) {
+    global.WordAudio.refreshStatus().then(() => {
+      if (global.WordAudio.status.installed) vlog('离线音频包已就绪（' + global.WordAudio.status.count + ' 词）');
+    }).catch(() => {});
+  }
 
   $$('.nav-btn').forEach(b => {
     b.onclick = () => {
