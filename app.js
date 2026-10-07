@@ -7,7 +7,7 @@
 
 /* 应用代码版本（与 sw.js 的 CACHE 对应）。
  * 排障用：华为浏览器地址栏访问 app.js 搜此常量即可确认平板实际运行的版本。 */
-const APP_VERSION = 'v1.2.4';
+const APP_VERSION = 'v1.2.5';
 
 /* ======================================================
  * 1. 内置数据：学年、单元、单词、奖励、文章
@@ -4423,14 +4423,15 @@ function renderVoskError(box, msg) {
   box.innerHTML = `离线识别模型加载失败：${esc(msg)}`;
   if (result) {
     result.innerHTML = `
-    <p class="muted" style="margin-top:6px">可能原因：网络不稳（模型从 CDN 下载，约 41MB）或存储空间不足。</p>
-    <button class="btn small" id="btn-vosk-retry">↻ 重试下载</button>`;
+    <p class="muted" style="margin-top:6px">可能原因：模型尚未下载（首次需联网，约 41MB）、当前无网络，或存储空间不足。<br>
+    本次跟读评分跳过，单词学习不受影响；联网后点重试即可恢复。</p>
+    <button class="btn small" id="btn-vosk-retry">↻ 重试</button>`;
     const btn = $('#btn-vosk-retry');
     if (btn) btn.onclick = () => {
       voskBroken = false; /* 解除判死，允许重新加载 */
       voskLoading = null;
       result.innerHTML = '';
-      switchToVosk(currentSessionWord(), box, '正在重新下载模型…');
+      switchToVosk(currentSessionWord(), box, '正在重新启动识别…');
     };
   }
 }

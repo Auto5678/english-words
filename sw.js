@@ -9,7 +9,7 @@
  * 注意：本应用数据全部在 localStorage / IndexedDB，与 SW 缓存无关；
  * SW 只负责离线打开页面与模型免重复下载。 */
 
-const CACHE = 'seven-a-english-v1.2.4';
+const CACHE = 'seven-a-english-v1.2.5';
 
 const CORE_FILES = [
   './',
@@ -33,10 +33,18 @@ self.addEventListener('install', event => {
   );
 });
 
+/* 版本升级时保留的缓存：vosk-model 是 Vosk 识别模型的独立持久缓存
+ * （41MB，下载一次永久使用）。旧版 activate 无差别删除所有非当前版本
+ * 缓存——每次发版都把模型删掉，飞行模式下模型加载失败（vosk-unavailable）。
+ * KEEP_CACHES 里的与版本升级无关，永不删除。 */
+const KEEP_CACHES = ['vosk-model'];
+
 self.addEventListener('activate', event => {
   event.waitUntil(
     caches.keys().then(keys =>
-      Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k)))
+      Promise.all(keys
+        .filter(k => k !== CACHE && !KEEP_CACHES.includes(k))
+        .map(k => caches.delete(k)))
     ).then(() => self.clients.claim())
   );
 });
