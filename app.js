@@ -7,7 +7,7 @@
 
 /* 应用代码版本（与 sw.js 的 CACHE 对应）。
  * 排障用：华为浏览器地址栏访问 app.js 搜此常量即可确认平板实际运行的版本。 */
-const APP_VERSION = 'v1.2.5';
+const APP_VERSION = 'v1.2.6';
 
 /* ======================================================
  * 1. 内置数据：学年、单元、单词、奖励、文章
@@ -4228,7 +4228,7 @@ async function downloadModelBlob(onProgress) {
 function ensureVoskModel(onProgress) {
   if (voskModel) return Promise.resolve(voskModel);
   if (voskBroken) return Promise.reject(new Error('vosk-unavailable'));
-  if (voskLoading) return voskLoading;
+  if (voskLoading) { subscribeVoskProgress(onProgress); return voskLoading; }
 
   if (typeof global.Vosk === 'undefined') {
     /* index.html 已同步引入 vendor-vosk.js；若将来改为按需加载，可在此动态注入 */
@@ -4236,26 +4236,79 @@ function ensureVoskModel(onProgress) {
     return Promise.reject(new Error('vosk-script-missing'));
   }
 
-  const progress = typeof onProgress === 'function' ? onProgress : null;
+  const progress = info => publishVoskProgress(info);
   vlog('Vosk 模型加载开始');
+  voskProgressLast = null; /* 上一轮加载的进度重放缓存作废 */
   voskLoading = downloadModelBlob(progress).then(blobUrl => {
     vlog('模型就绪（blob URL），开始初始化 WASM 引擎');
-    if (progress) progress({ stage: 'extracting' });
+    publishVoskProgress({ stage: 'extracting' });
     return global.Vosk.createModel(blobUrl, 0);
   }).then(model => {
     voskModel = model;
     voskLoading = null;
     vlog('Vosk 引擎初始化成功，识别可用');
-    if (progress) progress({ stage: 'ready' });
+    publishVoskProgress({ stage: 'ready' });
+    voskProgressSubs = []; /* 终态已送达，清订阅表（回调持有 DOM 引用，不清会滞留） */
     return model;
   }, err => {
     voskBroken = true; /* 本次失败；下一次点跟读重新尝试（不清 voskLoading 复用变量语义） */
     voskLoading = null;
+    voskProgressSubs = [];
     vlog('Vosk 模型加载失败：' + (err && err.message ? err.message : err));
     console.warn('[vosk] 模型加载失败', err);
     throw (err instanceof Error ? err : new Error('vosk-load-failed'));
   });
+  subscribeVoskProgress(onProgress);
   return voskLoading;
+}
+
+/* 模型加载进度的多订阅者分发。
+ * 背景：预热（preheatVosk）启动加载后，用户中途点跟读也要进度条——
+ * 旧实现只认加载发起者的那一个 onProgress，后来的回调被静默丢弃，
+ * 跟读界面干等。现在所有关心进度的人都可订阅：
+ * - 订阅即重放最近一条进度（后来者立刻看到当前状态，不用等下一个事件）
+ * - ready/失败时清空订阅表（Progress 回调持有 DOM 引用，不清会滞留） */
+let voskProgressSubs = [];
+let voskProgressLast = null;
+function subscribeVoskProgress(cb) {
+  if (typeof cb !== 'function') return;
+  voskProgressSubs.push(cb);
+  if (voskProgressLast) { try { cb(voskProgressLast); } catch (e) {} }
+}
+function publishVoskProgress(info) {
+  voskProgressLast = info;
+  voskProgressSubs.forEach(cb => { try { cb(info); } catch (e) {} });
+}
+
+/* 模型是否已有持久缓存（预热门槛：只预热"用过 Vosk"的设备） */
+async function voskModelCached() {
+  if (voskModel || modelBlobUrl) return true;
+  if (typeof caches === 'undefined') return false;
+  try {
+    const cache = await caches.open('vosk-model');
+    const hit = await cache.match(VOSK_CACHE_KEY);
+    return !!(hit && (await hit.blob()).size > 1024 * 1024);
+  } catch (e) { return false; }
+}
+
+/* Vosk 引擎预热：init() 启动时后台静默初始化，用户点跟读时已就绪。
+ *
+ * 门槛是"模型已缓存"而不是"无 Web Speech"：华为浏览器等内核的
+ * SpeechRecognition 是假活 API（存在但永不返回结果），按 API 存在性
+ * 判断会漏掉真正的目标设备；而模型缓存存在本身就证明这台设备
+ * 实际用过 Vosk。未缓存设备不预热、零流量（首次下载仍由跟读触发，
+ * 界面有进度条）。
+ *
+ * 失败静默（voskBroken 已置位，跟读时会给出完整错误与重试）；
+ * 与跟读并发安全：ensureVoskModel 幂等，共用同一个 voskLoading。 */
+async function preheatVosk() {
+  if (voskModel || voskLoading || voskBroken) return;
+  if (typeof global.Vosk === 'undefined') return;
+  if (!await voskModelCached()) return;
+  try {
+    vlog('Vosk 预热：检测到模型已缓存，后台初始化引擎');
+    await ensureVoskModel(null);
+  } catch (e) { /* 静默：跟读时再报错并给重试 */ }
 }
 
 /* 释放上一词的录音资源 */
@@ -6618,6 +6671,10 @@ function init() {
     }).catch(() => {});
   }
 
+  /* Vosk 引擎预热（仅模型已缓存的设备）：后台静默初始化 20-40 秒，
+   * 用户点跟读时已就绪——免去每词等待。未缓存设备零流量、零动作 */
+  preheatVosk();
+
   $$('.nav-btn').forEach(b => {
     b.onclick = () => {
       session = null; /* 切换页面放弃进行中的会话（不记完成事件） */
@@ -6671,7 +6728,7 @@ const api = {
   logEvent, alreadyRewardedToday, levelOf,
   weekStartKey, monthStartKey, prevMonthRange, computePeriodStats, pctOf, buildAdvice,
   clearLearningData, factoryReset, addUser, importGradeExcel, parseWordRows, applyGradeImport,
-  speak, speakOnline, splitForTTS, downloadModelBlob, ensureVoskModel,
+  speak, speakOnline, splitForTTS, downloadModelBlob, ensureVoskModel, preheatVosk,
   _setTTSForTest(o) { netTTS = !!o.netTTS; },
   /* 跟读引擎层（回归测试用：直达 Vosk 路径的会话补建） */
   _frTest: {
