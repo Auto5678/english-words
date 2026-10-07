@@ -9,13 +9,14 @@
  * 注意：本应用数据全部在 localStorage / IndexedDB，与 SW 缓存无关；
  * SW 只负责离线打开页面与模型免重复下载。 */
 
-const CACHE = 'seven-a-english-v1.1.5';
+const CACHE = 'seven-a-english-v1.2.0';
 
 const CORE_FILES = [
   './',
   './index.html',
   './style.css',
   './app.js',
+  './wordaudio.js',
   './vendor-xlsx.js',
   './vendor-vosk.js',
   './manifest.json',
@@ -47,8 +48,8 @@ self.addEventListener('fetch', event => {
   const url = new URL(req.url);
   if (url.origin !== self.location.origin) return; /* 只处理同源 */
 
-  /* 模型与其他大文件：网络优先，成功则入缓存（支持断点外的整档缓存） */
-  const isModel = url.pathname.includes('/model/');
+  /* 模型与音频包等大文件：网络优先，成功则入缓存（支持断点外的整档缓存） */
+  const isModel = url.pathname.includes('/model/') || url.pathname.includes('/audio-pack/');
   if (isModel) {
     event.respondWith(
       fetch(req).then(res => {
