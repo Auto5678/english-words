@@ -7,7 +7,7 @@
 
 /* 应用代码版本（与 sw.js 的 CACHE 对应）。
  * 排障用：华为浏览器地址栏访问 app.js 搜此常量即可确认平板实际运行的版本。 */
-const APP_VERSION = 'v1.2.3';
+const APP_VERSION = 'v1.2.4';
 
 /* ======================================================
  * 1. 内置数据：学年、单元、单词、奖励、文章
@@ -4454,8 +4454,10 @@ function renderModelProgress(box, info) {
       <div class="model-progress"><div style="width:${info.pct}%"></div></div>
       <span class="muted">${info.pct}% · ${mb(info.loaded)} / ${mb(info.total)}</span>`;
   } else if (info.stage === 'extracting' || info.stage === 'downloaded') {
+    /* 每次页面加载都要重初始化 WASM 引擎（缓存免下载，不免初始化）。
+     * 与首次下载区分文案，避免"又下载了？"的误解 */
     box.innerHTML = `
-      下载完成，正在解压模型（约 20-40 秒，此后永久离线可用）…
+      正在启动离线识别引擎（首次 20-40 秒，此后本次打开内秒开）…
       <div class="model-progress indeterminate"><div></div></div>`;
   } else if (info.stage === 'cached') {
     box.textContent = '模型已缓存，正在启动识别…';
@@ -6023,10 +6025,15 @@ function bindAudioPackPanel() {
   const btnDel = $('#ap-delete');
   const box = $('#audio-pack-progress');
 
-  /* 打开面板时刷新状态再渲染（status 可能仍是初始未刷新值） */
+  /* 打开面板时后台刷新一次状态：仅当显示的"已安装/未安装"与实际不符时
+   * 重渲染（无条件 renderParentArea 会无限循环——重渲染又绑定本函数，
+   * 又刷新又重渲染，modal DOM 反复重建导致无法交互，v1.2.4 修复） */
   const wa0 = typeof global.WordAudio !== 'undefined' ? global.WordAudio : null;
   if (wa0 && wa0.refreshStatus) {
-    wa0.refreshStatus().then(() => renderParentArea()).catch(() => {});
+    const shownInstalled = wa0.status.installed;
+    wa0.refreshStatus().then(() => {
+      if (wa0.status.installed !== shownInstalled) renderParentArea();
+    }).catch(() => {});
   }
 
   const run = (mode) => {
