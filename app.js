@@ -7,7 +7,7 @@
 
 /* 应用代码版本（与 sw.js 的 CACHE 对应）。
  * 排障用：华为浏览器地址栏访问 app.js 搜此常量即可确认平板实际运行的版本。 */
-const APP_VERSION = 'v1.2.0';
+const APP_VERSION = 'v1.2.1';
 
 /* ======================================================
  * 1. 内置数据：学年、单元、单词、奖励、文章
@@ -3105,6 +3105,7 @@ function normalizeState(s) {
     s.units = base.units;
     s.words = base.words;
     s.libVersion = LIB_VERSION;
+    _grammarTextCache = null; /* 词库整体更换：易混词语法缓存失效（7.4.1） */
     (s.users || []).forEach(u => {
       if (u.wordStates) {
         const alive = {};
@@ -3149,6 +3150,7 @@ function normalizeState(s) {
 }
 
 let state = null;
+let _grammarTextCache = null; /* 7.4.1 词库清洗文本缓存（易混词语法表用，词库变更时置空） */
 
 function saveState() {
   if (typeof localStorage === 'undefined') return; /* Node 测试环境 */
@@ -3612,18 +3614,95 @@ function similarity(a, b) {
   return 1 - editDistance(a, b) / max;
 }
 
-/* 7.4 跟读评分：0-100 */
+/* 7.4.1 词面清洗：供识别语法表与评分比对用。
+ * 词库词面带变体注记和占位符——"swing(swung)"、"make sb's/the bed"、
+ * "a / an"——识别器与评分都应只看主词面，否则这些词永远匹配不上。
+ * 规则：
+ *   1) 括号注记整体删除：swing(swung) → swing
+ *   2) sb's → somebody's（先于斜杠切）、sb → somebody、sth → something
+ *   3) pl. 变体注记删除：knife pl. knives → knife（词库无括号的注记脏数据）
+ *   4) 斜杠变体取第一项：a / an → a；theater/ theatre → theater
+ *   5) 占位符（... …… ?）与剩余标点删除：too ... to → too to
+ *      （学生实际读的就是短语本身，省略号只表示"中间有宾语"）
+ *   6) 撇号保留（识别模型词表含 somebody's 等屈折形式）
+ * 特判表：斜杠后是并列限定成分的词条（如 make sb's/the bed 保留 bed）。
+ * 注：与音频包 word-list.json 的口径不同——那是 TTS 合成口径
+ * （省略号保留作停顿、sb. 带句点），评分按学生读音比对故略有差异。 */
+const SPEAKABLE_SPECIALS = [
+  [/^make somebody's\/the bed$/i, "make somebody's bed"],
+];
+
+function speakableWordText(raw) {
+  let t = String(raw || '');
+  t = t.replace(/\(([^)]*)\)/g, ' ');                  /* 括号注记 */
+  t = t.replace(/sb's/gi, "somebody's").replace(/sb\./gi, 'somebody');
+  t = t.replace(/\bsth\b/gi, 'something').replace(/\bsb\b/gi, 'somebody');
+  t = t.replace(/\s*pl\.\s*\w+/gi, ' ');               /* pl. 变体注记 */
+  for (const [re, to] of SPEAKABLE_SPECIALS) {         /* 特判先于斜杠切分 */
+    if (re.test(t)) return to;
+  }
+  t = t.replace(/\s*\/\s*/g, ' / ');                    /* 规整斜杠间距 */
+  const slash = t.indexOf('/');
+  if (slash >= 0) t = t.slice(0, slash);                /* 斜杠变体取第一项 */
+  t = t.replace(/[^A-Za-z' -]/g, ' ');                  /* 去占位符与标点 */
+  t = t.replace(/\s+/g, ' ').trim();
+  return t.toLowerCase();
+}
+
+/* 7.4.1 易混词：词库内与目标词"听起来可能混"的候选，加入识别语法表。
+ * 旧版语法只有 [目标词, [unk]] 二选一，任何错读都被强判为目标词高置信——
+ * 评分虚高的根因。加入近邻词后，错读有机会被判成别的真实词，分数如实下降。
+ * 近邻 = 编辑距离 ≤ 词长阈值（≤3 字距 1；≤6 字距 2；更长距 3），上限 12 个
+ * （语法表过大拖慢识别器构建，且长尾词对区分度贡献小）。 */
+function confusableWords(target, allTexts) {
+  const t = speakableWordText(target);
+  if (!t) return [];
+  const words = t.split(' ');
+  const limit = t.length <= 3 ? 1 : t.length <= 6 ? 2 : 3;
+  const out = [];
+  for (let i = 0; i < allTexts.length && out.length < 12; i++) {
+    const cand = allTexts[i];
+    if (cand === t) continue;
+    if (Math.abs(cand.length - t.length) > limit) continue;
+    const cwords = cand.split(' ');
+    /* 短语与单词不互为易混（"pick up" vs "pick" 是不同任务） */
+    if (cwords.length !== words.length) continue;
+    const d = editDistance(t, cand);
+    if (d >= 1 && d <= limit) out.push(cand);
+  }
+  return out;
+}
+
+/* 7.4 跟读评分：0-100
+ * 目标词先过 speakableWordText 清洗（与识别语法、音频包一致）。
+ * 短语目标（含空格）按整句相似度 + 逐词命中加权——旧版对短语逐 token
+ * 与整个短语比相似度，短语永远拿不到高分（"pick up" vs token "pick"）。 */
 function scoreFollowRead(target, transcript, confidence) {
-  const t = (transcript || '').trim().toLowerCase().replace(/[^a-z\s]/g, '');
-  const w = (target || '').trim().toLowerCase();
+  /* transcript 与目标词同口径：保留撇号（识别输出 somebody's，
+   * 目标词清洗后也是 somebody's——旧版把 transcript 的撇号删掉，
+   * 所有格词永远差一个字符拿不到满分）。弯撇号归一为直撇号
+   * （Web Speech 输出 U+2019，Vosk/目标词是 U+0027）。 */
+  const t = (transcript || '').trim().toLowerCase().replace(/’/g, "'").replace(/[^a-z'\s-]/g, '');
+  const w = speakableWordText(target);
   if (!t) return 0;                       /* 识别不到发音 */
   const conf = typeof confidence === 'number' && confidence > 0 ? Math.min(confidence, 1) : 0.6;
   const tokens = t.split(/\s+/).filter(Boolean);
-  let bestSim = 0;
-  tokens.forEach(tok => {
-    const s = similarity(w, tok);
-    if (s > bestSim) bestSim = s;
-  });
+  const wWords = w.split(' ').filter(Boolean);
+  let bestSim;
+  if (wWords.length > 1) {
+    /* 短语：整句相似度为主，目标词逐个命中有加成 */
+    const whole = similarity(w, t.replace(/\s+/g, ' '));
+    let hit = 0;
+    wWords.forEach(tw => { if (tokens.includes(tw)) hit++; });
+    const hitRatio = hit / wWords.length;
+    bestSim = Math.max(whole, hitRatio * 0.8);
+  } else {
+    bestSim = 0;
+    tokens.forEach(tok => {
+      const s = similarity(w, tok);
+      if (s > bestSim) bestSim = s;
+    });
+  }
   if (bestSim >= 0.999) {
     /* 识别到目标词：基础 75 + 置信度，最高 100 */
     return Math.round(Math.min(100, 75 + conf * 25));
@@ -4286,6 +4365,29 @@ function beginWebSpeech(w, box) {
  * → 每块调用 recognizer.acceptWaveformFloat(samples, sampleRate)
  * → result 事件返回 { text, result:[{conf, word}] } → 复用 scoreFollowRead 评分。 */
 
+/* 7.4.1 识别语法表：目标词 + 词库易混词 + [unk]。
+ * 旧版语法仅 ['[unk]', 目标词]，识别器被强制二选一——任何错读都判为目标词
+ * 且置信度虚高（家长反馈"发音不准也 100 分"的根因）。加入易混词后，
+ * 错读有机会落到别的真实词上，置信度如实反映发音质量。
+ * _grammarTextCache 声明在全局状态区（let state 旁）。 */
+function libraryTextsForGrammar() {
+  if (_grammarTextCache) return _grammarTextCache;
+  const set = new Set();
+  state.words.forEach(w => {
+    const t = speakableWordText(w.text);
+    if (t) set.add(t);
+  });
+  _grammarTextCache = Array.from(set);
+  return _grammarTextCache;
+}
+
+function buildRecognizerGrammar(word) {
+  const target = speakableWordText(word.text);
+  const confusables = confusableWords(word.text, libraryTextsForGrammar());
+  const list = ['[unk]', target, ...confusables].filter(Boolean);
+  return JSON.stringify(list);
+}
+
 function switchToVosk(w, box, why) {
   if (fr) fr.switching = true;
   /* 不停共享录音：同词从 Web Speech 切过来时录音保持连续（回放完整）；
@@ -4390,7 +4492,7 @@ function beginVoskRecording(w, box) {
         }
         const src = audioCtx.createMediaStreamSource(stream);
 
-        recognizer = new model.KaldiRecognizer(audioCtx.sampleRate, JSON.stringify(['[unk]', w.text.toLowerCase()]));
+        recognizer = new model.KaldiRecognizer(audioCtx.sampleRate, buildRecognizerGrammar(w));
         recognizer.setWords(true);
         recognizer.on('result', msg => {
           if (settled) return;
@@ -6293,6 +6395,7 @@ function applyGradeImport(gradeId, parsed) {
     usr.wordStates = alive;
     usr.scopeUnits = usr.scopeUnits.filter(x => !x.startsWith(gradeId + '-u'));
   });
+  _grammarTextCache = null; /* 词库已变：易混词语法缓存失效（7.4.1） */
   saveState();
   return { units: parsed.unitOrder.length, words: parsed.wordCount, skipped: parsed.skipped };
 }
@@ -6363,6 +6466,7 @@ function openWordEditor(w) {
     } else {
       Object.assign(w, data);
     }
+    _grammarTextCache = null; /* 词库已变：易混词语法缓存失效（7.4.1） */
     saveState();
     alert('已保存。');
     renderParentArea();
@@ -6523,6 +6627,7 @@ const api = {
   /* 工具 */
   dateKey, todayKey, addDays, keyLE, nextInterval, editDistance, similarity,
   scoreFollowRead, scoreLabel, shuffle, uid,
+  speakableWordText, confusableWords, buildRecognizerGrammar, libraryTextsForGrammar,
   /* 业务 */
   applyDayResult, newWordState, buildDailyTask, scopeWordIds,
   logEvent, alreadyRewardedToday, levelOf,
