@@ -7,7 +7,7 @@
 
 /* 应用代码版本（与 sw.js 的 CACHE 对应）。
  * 排障用：华为浏览器地址栏访问 app.js 搜此常量即可确认平板实际运行的版本。 */
-const APP_VERSION = 'v1.2.6';
+const APP_VERSION = 'v1.3.0';
 
 /* ======================================================
  * 1. 内置数据：学年、单元、单词、奖励、文章
@@ -3396,14 +3396,13 @@ function setTTSStatus(mode, err) {
   const packInfo = wa && wa.status ? wa.status : null;
   const M = {
     idle: ['', ''],
-    sys: ['语音引擎：本地音频', ''],
-    online: ['语音引擎：在线发音（联网）', ''],
+    sys: ['语音引擎：本地音频', ''],    online: ['语音引擎：在线发音（联网）', ''],
     /* error 文案按音频包状态分类：装了 → 纯网络问题；没装 → 引导下载 */
     error: ['朗读暂不可用', packInfo && packInfo.count > 0
-      ? '系统无 TTS 引擎，在线发音也失败（网络不通）。已装的离线发音包只覆盖单词，句子仍需网络。'
-      : '系统无 TTS 引擎，在线发音失败（网络不通）。建议在家长区 → 离线发音 下载离线发音包（约 20MB，一次安装永久离线覆盖全部单词）。'],
+      ? '系统无 TTS 引擎，在线发音也失败（网络不通）。已装的离线发音包覆盖单词与阅读文章；其他句子仍需网络。'
+      : '系统无 TTS 引擎，在线发音失败（网络不通）。建议在家长区 → 离线发音 下载离线发音包（约 21MB，一次安装永久离线覆盖全部单词与阅读文章）。'],
     /* 词卡场景专属：音频包未装/未命中 + 在线也不通（典型：飞行模式） */
-    offline: ['朗读暂不可用（离线）', '离线发音包尚未安装，当前又无网络。联网后在家长区 → 离线发音 下载（约 20MB，一次安装永久离线）。'],
+    offline: ['朗读暂不可用（离线）', '离线发音包尚未安装，当前又无网络。联网后在家长区 → 离线发音 下载（约 21MB，一次安装永久离线）。'],
   }[mode] || ['', ''];
   if (!M[0]) { bar.classList.add('hidden'); bar.textContent = ''; return; }
   bar.classList.remove('hidden');
@@ -3517,6 +3516,38 @@ function speak(text, onEnd) {
   }
 
   speakFallback(text, onEnd);
+}
+
+/* 文章朗读（阶段 4 离线句子层）：
+ * audio 是 pickDailyArticle/pickWeeklyArticle 返回的拼接描述——
+ * builtin: 音频包里有整篇（article:aN）；generated: 开头/前缀后缀/结尾
+ * 模板 + 单词音频拼接。包未装/未命中 → 回退通用朗读链。
+ * 正文 text 仅用于回退与日志。 */
+function speakArticle(article, text, onEnd) {
+  const wa = typeof global.WordAudio !== 'undefined' ? global.WordAudio : null;
+  const a = article && article.audio;
+  if (!wa || !a) { speak(text, onEnd); return; }
+
+  const myToken = ++speakToken;
+  if (netTTSAudio) { try { netTTSAudio.pause(); } catch (e) {} netTTSAudio = null; netTTSToken++; }
+  setTTSStatus('sys');
+  vlog('文章离线朗读开始（' + a.kind + (a.id ? ':' + a.id : '') + '）');
+
+  const p = a.kind === 'builtin'
+    ? wa.playArticle(a.id)
+    : wa.playGeneratedArticle(a.ga.openIdx, a.ga.wordIds, a.ga.wordTmplIdxs, a.ga.closeIdx);
+
+  p.then(how => {
+    if (myToken !== speakToken) { vlog('文章离线朗读被打断'); return; }
+    if (how === 'played') { vlog('文章离线朗读完成'); if (onEnd) onEnd(); return; }
+    vlog('文章离线未命中（' + how + '，包' + (wa.status && wa.status.count > 0
+      ? '已装但缺文章条目' : '未安装') + '），回退原链路');
+    if (!wa.status || !wa.status.count) setTTSStatus('offline');
+    speak(text, onEnd);
+  }).catch(() => {
+    if (myToken !== speakToken) return;
+    speak(text, onEnd);
+  });
 }
 
 function speakFallback(text, onEnd) {
@@ -4805,11 +4836,24 @@ function renderFollowReadResult(w, score, transcript, ws) {
  * ====================================================== */
 
 /* 生成练习短文：把当日新词放入简单句模板 */
+/* 生成练习短文（无内置文章覆盖当日新词时的兜底）。
+ * 模板与 tts-audio/gen-articles.py 的 TEMPLATES、wordaudio.js 的
+ * GA_OPENS/GA_TMPLS/GA_CLOSES 三方同源——句式改动必须同步三处。
+ * 返回 { text, openIdx, wordIds, wordTmplIdxs, closeIdx }：
+ * 拼接参数暴露给离线播放层（wordaudio.playGeneratedArticle），
+ * 保证离线拼接听到的与屏幕文本逐句一致。 */
 function generateArticle(wordTexts) {
   const parts = [];
   const n = wordTexts.length;
   const openers = ['Today I learned some new words.', 'This is my English story.', 'Let me tell you about my day.'];
-  parts.push(openers[Math.floor(Math.random() * openers.length)]);
+  const openIdx = Math.floor(Math.random() * openers.length);
+  parts.push(openers[openIdx]);
+  /* 离线播放需要词 id（音频包按 id 索引）；文本模板用词文本 */
+  const wmap = wordMap();
+  const byText = {};
+  Object.keys(wmap).forEach(id => { byText[wmap[id].text.toLowerCase()] = id; });
+  const wordIds = [];
+  const wordTmplIdxs = [];
   wordTexts.forEach((wd, i) => {
     const tmpl = [
       `I saw the word "${wd}" in my book, and I wrote it down.`,
@@ -4818,10 +4862,16 @@ function generateArticle(wordTexts) {
       `Can you make a sentence with the word "${wd}"?`,
       `The word "${wd}" is very useful in English.`,
     ];
-    parts.push(tmpl[i % tmpl.length]);
+    const ti = i % tmpl.length;
+    wordTmplIdxs.push(ti);
+    const wid = byText[String(wd).toLowerCase()];
+    if (wid) wordIds.push(wid);
+    else wordIds.push(null); /* 词库外的词（如自定义句）无离线音频，播放时跳过 */
+    parts.push(tmpl[ti]);
   });
+  const closeIdx = n > 5 ? 0 : 1;
   parts.push(n > 5 ? 'These words help me read and write. English is fun!' : 'I will review them tomorrow. See you!');
-  return parts.join(' ');
+  return { text: parts.join(' '), openIdx, wordIds, wordTmplIdxs, closeIdx };
 }
 
 /* 文章中目标词高亮（词边界匹配，忽略大小写） */
@@ -4849,13 +4899,16 @@ function pickDailyArticle() {
     if (cover > bestCover) { bestCover = cover; best = a; }
   });
 
-  let title, text, targets;
+  let title, text, targets, audio; /* audio：离线拼接参数（内置文章=id，生成式=结构） */
   if (best && bestCover > 0) {
     title = best.title; text = best.text; targets = best.words.filter(t => targetSet.has(t.toLowerCase()));
+    audio = { kind: 'builtin', id: best.id };
   } else {
-    title = '今日练习短文'; text = generateArticle(newWordTexts); targets = newWordTexts;
+    const ga = generateArticle(newWordTexts);
+    title = '今日练习短文'; text = ga.text; targets = newWordTexts;
+    audio = { kind: 'generated', ga };
   }
-  return { title, text, targets, quizPool: targets.length ? targets : newWordTexts };
+  return { title, text, targets, quizPool: targets.length ? targets : newWordTexts, audio };
 }
 
 /* 周六中篇：统计本周学过的词 */
@@ -4877,13 +4930,16 @@ function pickWeeklyArticle() {
     if (cover > bestCover) { bestCover = cover; best = a; }
   });
 
-  let title, text, targets;
+  let title, text, targets, audio;
   if (best && bestCover > 0) {
     title = best.title; text = best.text; targets = best.words.filter(t => targetSet.has(t.toLowerCase()));
+    audio = { kind: 'builtin', id: best.id };
   } else {
-    title = '本周练习文章'; text = generateArticle(weekWordTexts.slice(0, 20)); targets = weekWordTexts.slice(0, 20);
+    const ga = generateArticle(weekWordTexts.slice(0, 20));
+    title = '本周练习文章'; text = ga.text; targets = weekWordTexts.slice(0, 20);
+    audio = { kind: 'generated', ga };
   }
-  return { title, text, targets, quizPool: targets.length ? targets : weekWordTexts };
+  return { title, text, targets, quizPool: targets.length ? targets : weekWordTexts, audio };
 }
 
 /* 8.1 阅读积分防重复：每天每日短文一次，每周六文章一次 */
@@ -4933,11 +4989,11 @@ function renderReading() {
     <div id="tts-status" class="tts-status hidden"></div>
   `);
 
-  $('#btn-read-daily').onclick = () => speak(daily.text);
+  $('#btn-read-daily').onclick = () => speakArticle(daily, daily.text);
   $('#btn-quiz-daily').onclick = () => openReadingQuiz(daily, 'article', 5);
   if (weeklyOK) {
     const wk = pickWeeklyArticle();
-    $('#btn-read-weekly').onclick = () => speak(wk.text);
+    $('#btn-read-weekly').onclick = () => speakArticle(wk, wk.text);
     $('#btn-quiz-weekly').onclick = () => openReadingQuiz(wk, 'weeklyArticle', 10);
   }
 }
@@ -6055,8 +6111,8 @@ function renderAudioPackPanel() {
   const pct = st.count ? Math.round(st.count / totalWords * 100) : 0;
   return `
     <h4>离线发音包</h4>
-    <p class="muted">下载全部 ${totalWords} 个单词的标准读音（amy 音色，约 20MB，下载一次永久离线）。
-    安装后学习卡片/跟读的示范读音不再依赖网络，与离线识别模型配合实现完全离线学习。</p>
+    <p class="muted">下载全部 ${totalWords} 个单词的标准读音 + 全部阅读文章朗读（amy 音色，约 21MB，下载一次永久离线）。
+    安装后学习卡片/跟读示范读音、阅读文章朗读不再依赖网络，与离线识别模型配合实现完全离线学习。</p>
     <div class="diag-box">
       <div class="diag-row"><b>状态：</b>${st.installed
         ? '✅ 已安装（' + st.count + ' 词，' + (st.voice || 'amy') + ' 音色）'
@@ -6728,7 +6784,8 @@ const api = {
   logEvent, alreadyRewardedToday, levelOf,
   weekStartKey, monthStartKey, prevMonthRange, computePeriodStats, pctOf, buildAdvice,
   clearLearningData, factoryReset, addUser, importGradeExcel, parseWordRows, applyGradeImport,
-  speak, speakOnline, splitForTTS, downloadModelBlob, ensureVoskModel, preheatVosk,
+  speak, speakArticle, speakOnline, splitForTTS, downloadModelBlob, ensureVoskModel, preheatVosk,
+  generateArticle,
   _setTTSForTest(o) { netTTS = !!o.netTTS; },
   /* 跟读引擎层（回归测试用：直达 Vosk 路径的会话补建） */
   _frTest: {

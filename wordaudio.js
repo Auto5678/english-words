@@ -271,6 +271,80 @@
     }).catch(() => 'miss');
   }
 
+  /* ---- 句子层（阶段 4：文章与生成式文章的离线朗读） ----
+   *
+   * 包内条目命名空间（v2 包，build-pack.py 产出）：
+   *   article:a1..a7        内置文章整篇
+   *   ga:ga_open_0..2       生成式文章开头
+   *   ga:ga_tmp_{i}_a/b     生成式句式 i 的前缀/后缀（单词夹在中间）
+   *   ga:ga_close_0..1      生成式文章结尾
+   * 单词片段直接复用词条目（词 id），所以生成式文章的离线朗读 =
+   * 开头 → (前缀 → 单词 → 后缀)×N → 结尾 顺序拼接播放。 */
+
+  /* 生成式文章模板表——与 app.js generateArticle()、tts-audio/gen-articles.py
+   * 的 TEMPLATES 三方同源约定，改任何一处必须同步其余两处 */
+  const GA_OPENS = ['ga:ga_open_0', 'ga:ga_open_1', 'ga:ga_open_2'];
+  const GA_TMPLS = [
+    ['ga:ga_tmp_0_a', 'ga:ga_tmp_0_b'],
+    ['ga:ga_tmp_1_a', 'ga:ga_tmp_1_b'],
+    ['ga:ga_tmp_2_a', 'ga:ga_tmp_2_b'],
+    ['ga:ga_tmp_3_a', 'ga:ga_tmp_3_b'],
+    ['ga:ga_tmp_4_a', 'ga:ga_tmp_4_b'],
+  ];
+  const GA_CLOSES = ['ga:ga_close_0', 'ga:ga_close_1'];
+
+  /* 逐条目顺序播放（共用电荷：任一 miss → 整体 miss，让调用方回退；
+   * 单条 err/timeout → 跳过继续，与在线链"单段失败跳过"语义一致） */
+  function playEntryList(keys, onEnd) {
+    let i = 0;
+    let misses = 0;
+    const step = () => {
+      if (i >= keys.length) {
+        if (misses > 0 && misses === keys.length) return Promise.resolve('miss');
+        if (onEnd) onEnd();
+        return Promise.resolve('played');
+      }
+      const key = keys[i++];
+      return getWordAudioURL(key).then(url => {
+        if (!url) { misses++; return step(); }
+        return new Promise(resolve => {
+          const a = new Audio(url);
+          let settled = false;
+          const finish = () => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(guard);
+            resolve(step()); /* 链式：本条播完续下一条 */
+          };
+          const guard = setTimeout(finish, 12000);
+          a.onended = finish;
+          a.onerror = finish; /* err 跳过续播，不整体失败 */
+          a.play().catch(finish);
+        });
+      });
+    };
+    return step().catch(() => 'miss');
+  }
+
+  /* 播放内置文章：返回 Promise<'played'|'miss'> */
+  function playArticle(articleId, onEnd) {
+    return playEntryList(['article:' + articleId], onEnd);
+  }
+
+  /* 播放生成式文章（app.js generateArticle 的拼接形态）。
+   * openIdx/tmpl 选择/结尾选择由调用方决定（与 generateArticle 完全同构，
+   * 保证听到的拼接与屏幕上文章文本一致）。
+   * words: [wordId...]（按文章顺序）。*/
+  function playGeneratedArticle(openIdx, wordIds, wordTmplIdxs, closeIdx, onEnd) {
+    const keys = [GA_OPENS[openIdx % GA_OPENS.length]];
+    wordIds.forEach((wid, i) => {
+      const t = GA_TMPLS[wordTmplIdxs[i] % GA_TMPLS.length];
+      keys.push(t[0], wid, t[1]);
+    });
+    keys.push(GA_CLOSES[closeIdx % GA_CLOSES.length]);
+    return playEntryList(keys, onEnd);
+  }
+
   /* ---- 管理 ---- */
   async function deleteWordAudioPack() {
     await idbClear(STORE);
@@ -287,6 +361,9 @@
       ensureWordAudioPack: async () => { throw new Error('此环境无 IndexedDB'); },
       playWord: async () => 'miss',
       getWordAudioURL: async () => null,
+      playArticle: async () => 'miss',
+      playGeneratedArticle: async () => 'miss',
+      playEntryList: async () => 'miss',
       deleteWordAudioPack: async () => status,
       refreshStatus: async () => status,
       status,
@@ -296,6 +373,7 @@
 
   global.WordAudio = {
     ensureWordAudioPack, playWord, getWordAudioURL,
+    playArticle, playGeneratedArticle, playEntryList,
     deleteWordAudioPack, refreshStatus, status,
   };
 })(typeof window !== 'undefined' ? window : globalThis);
