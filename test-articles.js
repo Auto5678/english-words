@@ -56,7 +56,7 @@ function t(name, cond) {
   const indexBuf = fs.readFileSync(path.join(PACK_DIR, 'pack.index'));
   const idxLen = indexBuf[4] | (indexBuf[5] << 8) | (indexBuf[6] << 16) | (indexBuf[7] << 24);
   const meta = JSON.parse(new TextDecoder().decode(indexBuf.slice(8, 8 + idxLen)));
-  t('包版本 v2', meta.version === 2);
+  t('包版本 v3', meta.version === 3);
   t('article 条目 7 篇', ['a1','a2','a3','a4','a5','a6','a7'].every(id => meta.files['article:' + id]));
   const gaKeys = Object.keys(meta.files).filter(k => k.startsWith('ga:'));
   t('ga 模板条目 15 个', gaKeys.length === 15);

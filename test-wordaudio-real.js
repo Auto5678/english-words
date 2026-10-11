@@ -73,7 +73,7 @@ function check(name, cond) {
   console.log('\n  安装耗时 ' + ((Date.now() - t0) / 1000).toFixed(1) + 's');
   check('installed', st.installed === true);
   check('count=2718', st.count === 2718);
-  check('version=2', st.version === 2);
+  check('version=3', st.version === 3);
   check('voice=amy-medium', st.voice === 'amy-medium');
 
   /* v2 包条目命名空间：词 id（gPri-…）/ article:aN / ga:ga_*

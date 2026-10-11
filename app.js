@@ -7,7 +7,7 @@
 
 /* 应用代码版本（与 sw.js 的 CACHE 对应）。
  * 排障用：华为浏览器地址栏访问 app.js 搜此常量即可确认平板实际运行的版本。 */
-const APP_VERSION = 'v1.3.0';
+const APP_VERSION = 'v1.3.1';
 
 /* ======================================================
  * 1. 内置数据：学年、单元、单词、奖励、文章
@@ -1327,7 +1327,7 @@ const RAW_WORDS_G8A = {
     ["everyone", "pron.", "每人；人人；所有人", "/' ev. ri. wʌn/"],
     ["of course", "adv.", "当然; 自然", "/ɒv/ /kɔ:s/"],
     ["myself", "pron.", "我自己；我本人", "/maɪ' self/"],
-    ["yourselfpl.yourselves", "pron.", "你自己；您自己", "/jɔ:' self/"],
+    ["yourself (pl. yourselves)", "pron.", "你自己；您自己", "/jɔ:' self/"],
     ["hen", "n.", "母鸡", "/ hen/"],
     ["pig", "n.", "猪", "/pɪg/"],
     ["seem", "v.", "好像；似乎；看来", "/ si:m/"],
@@ -1806,7 +1806,7 @@ const RAW_WORDS_G8B = {
     ["kilo / kilogram", "n.", "千克；公斤", "/' ki:. ləʊ//'kɪl.ə.græm/"],
     ["rock", "n.", "岩石", "/rɒk/"],
     ["run out(of)", "v. phr.", "用尽; 耗尽", "/rʌn/ /aʊt/ /əv/"],
-    ["knife pl. knives", "n.", "刀", "/naɪf//naɪvz/"],
+    ["knife (pl. knives)", "n.", "刀", "/naɪf//naɪvz/"],
     ["cut off", "v. phr.", "切除", "/kʌt/ /ɒf/"],
     ["blood", "n.", "血", "/blʌd/"],
     ["mean(meant)", "v.", "意思是；打算；意欲", "/ mi:n/ / ment/"],
@@ -2120,7 +2120,7 @@ const RAW_WORDS_G8B = {
     ["hurry", "v.", "匆忙；赶快", "/'hʌr. i/"],
     ["hurry up", "v. phr.", "赶快; 急忙(做某事)", "/'hʌr. i//ʌp/"],
     ["due", "adj.", "预期; 预定", "/ dju:/"],
-    ["fishermanpl.fishermen", "n.", "渔民；钓鱼者", "/'fɪʃ.ə.mən/"],
+    ["fisherman (pl. fishermen)", "n.", "渔民；钓鱼者", "/'fɪʃ.ə.mən/"],
     ["pull", "v.", "拉; 拖", "/pʊl/"],
     ["shark", "n.", "鲨鱼", "/ʃɑːk/"],
     ["bone", "n.", "骨头", "/bəʊn/"],
@@ -2354,7 +2354,7 @@ const RAW_WORDS_G9A = {
     ["pass by", "v. phr.", "路过; 经过", "/pɑːs//baɪ/"],
     ["staff", "n.", "管理人员；职工", "/stɑ:f/"],
     ["grape", "n.", "葡萄", "/greɪp/"],
-    ["policemanpl.policemen", "n.", "男警察", "/pə' li:s.mən//pə' li:s.mən/"],
+    ["policeman (pl. policemen)", "n.", "男警察", "/pə' li:s.mən//pə' li:s.mən/"],
     ["central", "adj.", "中心的；中央的", "/' sen.trəl/"],
     ["nearby", "adj.", "附近的; 邻近的 adv.(在)附近", "/ˌnɪə'baɪ/"],
     ["pardon me", "", "抱歉；对不起；什么，请再说一遍", "/'pɑː.dən/ / mi:/"],
@@ -2434,7 +2434,7 @@ const RAW_WORDS_G9A = {
     ["fair", "n.", "展览会；交易会", "/feər/"],
     ["environmental", "adj.", "自然环境的；有关环境的", "/ɪn. vaɪ.rə' men.təl/"],
     ["grass", "n.", "草；草地", "/grɑːs/"],
-    ["leaf pl. leaves", "n.", "叶；叶子", "/ li:f/ / li: vz/"],
+    ["leaf (pl. leaves)", "n.", "叶；叶子", "/ li:f/ / li: vz/"],
     ["produce", "v.", "生产；制造；出产", "/prə'dʒuːs/"],
     ["widely", "adv.", "广泛地；普遍地", "/'waɪd. li/"],
     ["be known for", "v. phr.", "以……闻名; 为人知晓", "/ bi://nəʊn/ /fɔ:r/"],
